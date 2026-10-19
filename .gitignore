@@ -1,0 +1,8 @@
+# Generated OCI health-check reports
+reports/
+OCI_Health_Report_*.html
+OCI_Health_Report_*.json
+
+# Local OCI credentials
+.oci/
+*.pem

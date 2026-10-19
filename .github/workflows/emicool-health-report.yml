@@ -1,0 +1,100 @@
+name: Generate EMICOOL OCI health report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs daily at 06:00 UTC. GitHub schedules run from the default branch.
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emicool-oci-health-report
+  cancel-in-progress: false
+
+jobs:
+  generate-report:
+    name: Generate EMICOOL report
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Configure OCI API-key authentication
+        shell: bash
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_EMICOOL_TENANCY_OCID }}
+          OCI_USER: ${{ secrets.OCI_EMICOOL_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_EMICOOL_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_EMICOOL_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_EMICOOL_PRIVATE_KEY }}
+          OCI_PRIVATE_KEY_PASSPHRASE: ${{ secrets.OCI_EMICOOL_PRIVATE_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          for required_secret in OCI_TENANCY OCI_USER OCI_FINGERPRINT OCI_REGION OCI_PRIVATE_KEY; do
+            if [[ -z "${!required_secret:-}" ]]; then
+              echo "::error title=Missing GitHub secret::${required_secret} is required. See README.md for setup."
+              exit 1
+            fi
+          done
+
+          oci_directory="${RUNNER_TEMP}/emicool-oci"
+          oci_key_file="${oci_directory}/api_key.pem"
+          oci_config_file="${oci_directory}/config"
+          umask 077
+          mkdir -p "${oci_directory}"
+          printf '%s\n' "${OCI_PRIVATE_KEY}" > "${oci_key_file}"
+          {
+            printf '[EMICOOL]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=%s\n' \
+              "${OCI_USER}" \
+              "${OCI_FINGERPRINT}" \
+              "${OCI_TENANCY}" \
+              "${OCI_REGION}" \
+              "${oci_key_file}"
+            if [[ -n "${OCI_PRIVATE_KEY_PASSPHRASE:-}" ]]; then
+              printf 'pass_phrase=%s\n' "${OCI_PRIVATE_KEY_PASSPHRASE}"
+            fi
+          } > "${oci_config_file}"
+
+          echo "OCI_CONFIG_FILE=${oci_config_file}" >> "${GITHUB_ENV}"
+          echo "OCI_CONFIG_DIRECTORY=${oci_directory}" >> "${GITHUB_ENV}"
+
+      - name: Generate EMICOOL health report
+        run: |
+          mkdir -p reports
+          python oci_health_check.py \
+            --profile EMICOOL \
+            --customer-name "EMICOOL" \
+            --config-file "${OCI_CONFIG_FILE}" \
+            --output reports
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emicool-oci-health-report-${{ github.run_number }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove OCI credentials from runner
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${OCI_CONFIG_DIRECTORY:-}" ]]; then
+            rm -rf "${OCI_CONFIG_DIRECTORY}"
+          fi
