@@ -37,10 +37,13 @@ Configure the following before the first run:
 
 | GitHub Actions configuration | Name | Value |
 | --- | --- | --- |
-| Repository secret | `EMICOOL_REPORT_GMAIL_APP_PASSWORD` | Gmail app password for `ziad.cee@gmail.com` |
+| Repository secret | `EMICOOL_REPORT_SMTP_HOST` | `smtp.gmail.com` |
+| Repository secret | `EMICOOL_REPORT_SMTP_PORT` | `587` |
+| Repository secret | `EMICOOL_REPORT_SMTP_USERNAME` | `ziad.cee@gmail.com` |
+| Repository secret | `EMICOOL_REPORT_SMTP_PASSWORD` | Gmail app password for `ziad.cee@gmail.com` |
 
 Enable 2-Step Verification on `ziad.cee@gmail.com`, create a Gmail **App
-Password**, then add it as `EMICOOL_REPORT_GMAIL_APP_PASSWORD` in
+Password**, then replace the value of `EMICOOL_REPORT_SMTP_PASSWORD` in
 **Settings > Secrets and variables > Actions > Secrets**. The workflow uses
 Gmail SMTP with STARTTLS (`smtp.gmail.com` on port `587`); no Gmail credential
 is stored in this repository.
