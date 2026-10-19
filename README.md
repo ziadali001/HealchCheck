@@ -28,7 +28,7 @@ these repository secrets:
 
 ## Test-email configuration
 
-Successful reports are emailed from `Ziad.Abdelrazek@zaintech.com` to
+Successful reports are emailed from `ziad.cee@gmail.com` to
 `zma.cee@gmail.com` with the subject `TEST — EMICOOL OCI daily
 health report`. The HTML and JSON reports are attached. There are no customer
 recipients in the workflow.
@@ -37,14 +37,13 @@ Configure the following before the first run:
 
 | GitHub Actions configuration | Name | Value |
 | --- | --- | --- |
-| Repository secret | `EMICOOL_REPORT_SMTP_HOST` | SMTP relay hostname used by `Ziad.Abdelrazek@zaintech.com` |
-| Repository secret | `EMICOOL_REPORT_SMTP_PORT` | SMTP STARTTLS port, usually `587` |
-| Repository secret | `EMICOOL_REPORT_SMTP_USERNAME` | SMTP username, usually `Ziad.Abdelrazek@zaintech.com` |
-| Repository secret | `EMICOOL_REPORT_SMTP_PASSWORD` | SMTP password or app password |
+| Repository secret | `EMICOOL_REPORT_GMAIL_APP_PASSWORD` | Gmail app password for `ziad.cee@gmail.com` |
 
-Add all four values in **Settings > Secrets and variables > Actions > Secrets**.
-The mailbox must be permitted to use authenticated SMTP/STARTTLS from GitHub
-Actions. No relay credential is stored in this repository.
+Enable 2-Step Verification on `ziad.cee@gmail.com`, create a Gmail **App
+Password**, then add it as `EMICOOL_REPORT_GMAIL_APP_PASSWORD` in
+**Settings > Secrets and variables > Actions > Secrets**. The workflow uses
+Gmail SMTP with STARTTLS (`smtp.gmail.com` on port `587`); no Gmail credential
+is stored in this repository.
 
 Use an API signing key for a dedicated automation user where possible. Give the
 user only the read permissions necessary for the OCI resources included in the
