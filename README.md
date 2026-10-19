@@ -2,7 +2,8 @@
 
 This repository generates the EMICOOL OCI health report through GitHub Actions.
 The workflow runs the existing `oci_health_check.py` with only the `EMICOOL`
-OCI profile and creates both HTML and JSON reports.
+OCI profile, creates both HTML and JSON reports, and sends them to the test
+recipient only. It does not send reports to an EMICOOL customer address.
 
 ## When it runs
 
@@ -25,6 +26,27 @@ these repository secrets:
 | `OCI_EMICOOL_PRIVATE_KEY` | Complete private-key PEM, including the `BEGIN` and `END` lines |
 | `OCI_EMICOOL_PRIVATE_KEY_PASSPHRASE` | Optional passphrase, only if the private key is encrypted |
 
+## Test-email configuration
+
+Successful reports are emailed from `Ziad.Abdelrazek@zaintech.com` to
+`zma.cee@gmail.com` with the subject `TEST — EMICOOL OCI daily
+health report`. The HTML and JSON reports are attached. There are no customer
+recipients in the workflow.
+
+Configure the following before the first run:
+
+| GitHub Actions configuration | Name | Value |
+| --- | --- | --- |
+| Repository variable | `EMICOOL_REPORT_SMTP_HOST` | SMTP relay hostname used by `Ziad.Abdelrazek@zaintech.com` |
+| Repository variable | `EMICOOL_REPORT_SMTP_PORT` | SMTP STARTTLS port, usually `587` |
+| Repository secret | `EMICOOL_REPORT_SMTP_USERNAME` | SMTP username, usually `Ziad.Abdelrazek@zaintech.com` |
+| Repository secret | `EMICOOL_REPORT_SMTP_PASSWORD` | SMTP password or app password |
+
+Add variables in **Settings > Secrets and variables > Actions > Variables**
+and secrets in **Settings > Secrets and variables > Actions > Secrets**.
+The mailbox must be permitted to use authenticated SMTP/STARTTLS from GitHub
+Actions. No relay credential is stored in this repository.
+
 Use an API signing key for a dedicated automation user where possible. Give the
 user only the read permissions necessary for the OCI resources included in the
 report.
@@ -35,6 +57,7 @@ commit an OCI config or PEM key to this repository.
 
 ## Report access
 
-After a run completes, open that run from the **Actions** tab and download the
-artifact from its **Artifacts** section. The workflow does not email or publish
-the reports outside GitHub.
+After a run completes, the test email is sent only after report generation
+succeeds. You can also open that run from the **Actions** tab and download the
+report artifact from its **Artifacts** section. This keeps a GitHub copy of
+every report for 30 days.

@@ -6,3 +6,4 @@ OCI_Health_Report_*.json
 # Local OCI credentials
 .oci/
 *.pem
+__pycache__/
