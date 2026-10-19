@@ -37,13 +37,12 @@ Configure the following before the first run:
 
 | GitHub Actions configuration | Name | Value |
 | --- | --- | --- |
-| Repository variable | `EMICOOL_REPORT_SMTP_HOST` | SMTP relay hostname used by `Ziad.Abdelrazek@zaintech.com` |
-| Repository variable | `EMICOOL_REPORT_SMTP_PORT` | SMTP STARTTLS port, usually `587` |
+| Repository secret | `EMICOOL_REPORT_SMTP_HOST` | SMTP relay hostname used by `Ziad.Abdelrazek@zaintech.com` |
+| Repository secret | `EMICOOL_REPORT_SMTP_PORT` | SMTP STARTTLS port, usually `587` |
 | Repository secret | `EMICOOL_REPORT_SMTP_USERNAME` | SMTP username, usually `Ziad.Abdelrazek@zaintech.com` |
 | Repository secret | `EMICOOL_REPORT_SMTP_PASSWORD` | SMTP password or app password |
 
-Add variables in **Settings > Secrets and variables > Actions > Variables**
-and secrets in **Settings > Secrets and variables > Actions > Secrets**.
+Add all four values in **Settings > Secrets and variables > Actions > Secrets**.
 The mailbox must be permitted to use authenticated SMTP/STARTTLS from GitHub
 Actions. No relay credential is stored in this repository.
 
