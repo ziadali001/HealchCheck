@@ -94,7 +94,7 @@ jobs:
       - name: Email test report to Ziad
         if: success()
         env:
-          REPORT_TEST_RECIPIENT: zma.cee@gmail.com
+          REPORT_TEST_RECIPIENT: Ziad.Abdelrazek@zaintech.com
           REPORT_SENDER: ziad.cee@gmail.com
           SMTP_HOST: ${{ secrets.EMICOOL_REPORT_SMTP_HOST }}
           SMTP_PORT: ${{ secrets.EMICOOL_REPORT_SMTP_PORT }}

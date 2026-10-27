@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 
 """
-OCI Daily Health Check
+OCI Weekly Health Check
 --------------------------------
 
 Purpose:
-    Collect OCI tenancy resources and generate:
+    Collect OCI tenancy resources for the last 7 days (configurable)
+    and generate:
 
-        1. HTML health report
-        2. JSON inventory
+        1. HTML health report, including prioritized recommendations
+        2. JSON inventory (same data, plus the recommendations list)
+
+    Cost, utilization (average and peak), OCI announcements and new
+    resources all cover the same trailing window; cost is compared with
+    the window immediately before it (week-over-week by default).
 
 Inspired by Oracle OCI ShowOCI approach.
 
 Authentication:
     ~/.oci/config
 
-Example:
+Example (weekly report, default profile):
     python3 oci_health_check.py
 
 Specific profile:
@@ -24,8 +29,8 @@ Specific profile:
 Only selected region:
     python3 oci_health_check.py --region me-jeddah-1
 
-Announcements:
-    python3 oci_health_check.py --announcement-days 30
+Different reporting window (e.g. two weeks):
+    python3 oci_health_check.py --days 14
 
 Customer-facing report (recommended when sending to a customer):
     python3 oci_health_check.py --profile CUSTOMER_A --customer-name "OCI Customer A"
@@ -75,9 +80,29 @@ except ImportError:
 # CONFIGURATION
 # ============================================================
 
+# The report is a weekly health check: cost, utilization, announcements
+# and "new resources" all cover the same trailing window (the last N full
+# days), and cost is compared against the N days immediately before it
+# (week-over-week by default). Individual windows can still be overridden
+# from the command line.
+DEFAULT_REPORT_PERIOD_DAYS = 7
 DEFAULT_BACKUP_MAX_AGE_DAYS = 2
-DEFAULT_ANNOUNCEMENT_DAYS = 30
-DEFAULT_COST_ANALYSIS_DAYS = 30
+DEFAULT_ANNOUNCEMENT_DAYS = DEFAULT_REPORT_PERIOD_DAYS
+DEFAULT_COST_ANALYSIS_DAYS = DEFAULT_REPORT_PERIOD_DAYS
+DEFAULT_UTILIZATION_DAYS = DEFAULT_REPORT_PERIOD_DAYS
+
+# Utilization thresholds. "avg" is the mean of hourly means over the
+# whole period (sustained load); "peak" is the highest hourly mean.
+CPU_HIGH_PERCENT = 80
+MEMORY_HIGH_PERCENT = 85
+DISK_HIGH_PERCENT = 80
+IDLE_CPU_AVG_PERCENT = 5
+IDLE_CPU_PEAK_PERCENT = 20
+
+# Cost recommendation thresholds.
+COST_INCREASE_WARN_PERCENT = 10
+COST_INCREASE_HIGH_PERCENT = 25
+COST_DAILY_SPIKE_FACTOR = 1.5
 
 # Resource types that are recurring, automatically generated artifacts of
 # infrastructure that already exists (e.g. daily policy-based backups).
@@ -254,7 +279,8 @@ class OCIHealthCheck:
         config_file=None,
         max_workers=6,
         customer_name=None,
-        cost_analysis_days=DEFAULT_COST_ANALYSIS_DAYS
+        cost_analysis_days=DEFAULT_COST_ANALYSIS_DAYS,
+        utilization_days=DEFAULT_UTILIZATION_DAYS
     ):
 
         self.profile = profile
@@ -267,6 +293,7 @@ class OCIHealthCheck:
         self.announcement_days = announcement_days
         self.backup_max_age_days = backup_max_age_days
         self.cost_analysis_days = max(1, min(int(cost_analysis_days), 90))
+        self.utilization_days = max(1, min(int(utilization_days), 90))
         self.max_workers = max(1, min(int(max_workers), 12))
         self.config_file = os.path.expanduser(
             config_file
@@ -277,6 +304,7 @@ class OCIHealthCheck:
         )
 
         self.errors = []
+        self.resource_costs = {}
         self.state_lock = threading.Lock()
         self.policy_cache = {}
         self.image_os_cache = {}
@@ -1807,25 +1835,12 @@ class OCIHealthCheck:
                     "age_days":
                         round(age_days, 2)
                         if age_days is not None
-                        else None
+                        else None,
+                    "source_volume_id":
+                        getattr(backup, "volume_id", None),
+                    "backup_type":
+                        safe(getattr(backup, "source_type", None))
                 })
-
-                if (
-                    age_days is not None
-                    and age_days > self.backup_max_age_days
-                ):
-
-                    with self.state_lock:
-                        self.data[
-                            "backup_issues"
-                        ].append({
-                            "region": region,
-                            "compartment":
-                                compartment["path"],
-                            "name": get_name(backup),
-                            "reason":
-                                f"Backup is {age_days:.1f} days old"
-                        })
 
         except Exception as exc:
 
@@ -1877,25 +1892,12 @@ class OCIHealthCheck:
                     "age_days":
                         round(age_days, 2)
                         if age_days is not None
-                        else None
+                        else None,
+                    "source_volume_id":
+                        getattr(backup, "boot_volume_id", None),
+                    "backup_type":
+                        safe(getattr(backup, "source_type", None))
                 })
-
-                if (
-                    age_days is not None
-                    and age_days > self.backup_max_age_days
-                ):
-
-                    with self.state_lock:
-                        self.data[
-                            "backup_issues"
-                        ].append({
-                            "region": region,
-                            "compartment":
-                                compartment["path"],
-                            "name": get_name(backup),
-                            "reason":
-                                f"Backup is {age_days:.1f} days old"
-                        })
 
         except Exception as exc:
 
@@ -2693,6 +2695,14 @@ class OCIHealthCheck:
         metric_name,
         compartment_id
     ):
+        """
+        Return (average, peak) utilization for the reporting period.
+
+        One query returns hourly means across the whole window; the
+        average of those is the sustained load, and the highest hourly
+        mean is the peak. Returns (None, None) when the instance reports
+        no data (e.g. the Compute Instance Monitoring plugin is off).
+        """
 
         try:
 
@@ -2702,6 +2712,8 @@ class OCIHealthCheck:
                 f'.mean()'
             )
 
+            end_time = now_utc()
+
             response = monitoring_client.summarize_metrics_data(
                 compartment_id=compartment_id,
                 summarize_metrics_data_details=
@@ -2709,11 +2721,12 @@ class OCIHealthCheck:
                     namespace="oci_computeagent",
                     query=query,
                     start_time=(
-                        now_utc()
+                        end_time
                         -
-                        datetime.timedelta(hours=1)
+                        datetime.timedelta(days=self.utilization_days)
                     ),
-                    end_time=now_utc()
+                    end_time=end_time,
+                    resolution="1h"
                 )
             )
 
@@ -2737,15 +2750,15 @@ class OCIHealthCheck:
 
             if values:
 
-                return round(
-                    sum(values) / len(values),
-                    2
+                return (
+                    round(sum(values) / len(values), 2),
+                    round(max(values), 2)
                 )
 
         except Exception:
-            return None
+            return None, None
 
-        return None
+        return None, None
 
 
     def get_instance_utilization(
@@ -2765,20 +2778,26 @@ class OCIHealthCheck:
             ("disk", "DiskUtilization")
         ]:
 
-            values[label] = self.get_metric_utilization(
-                monitoring_client,
-                instance_id,
-                metric_name,
-                compartment_id
+            values[label], values[f"{label}_peak"] = (
+                self.get_metric_utilization(
+                    monitoring_client,
+                    instance_id,
+                    metric_name,
+                    compartment_id
+                )
             )
 
         item = {
             "region": region,
             "compartment": compartment,
             "instance_id": instance_id,
+            "period_days": self.utilization_days,
             "cpu": values["cpu"],
+            "cpu_peak": values["cpu_peak"],
             "memory": values["memory"],
-            "disk": values["disk"]
+            "memory_peak": values["memory_peak"],
+            "disk": values["disk"],
+            "disk_peak": values["disk_peak"]
         }
 
         with self.state_lock:
@@ -2786,8 +2805,11 @@ class OCIHealthCheck:
 
         return {
             "cpu_percent": values["cpu"],
+            "cpu_peak_percent": values["cpu_peak"],
             "memory_percent": values["memory"],
-            "disk_percent": values["disk"]
+            "memory_peak_percent": values["memory_peak"],
+            "disk_percent": values["disk"],
+            "disk_peak_percent": values["disk_peak"]
         }
 
 
@@ -3157,6 +3179,11 @@ class OCIHealthCheck:
                 )
             )
 
+        self.resource_costs = {
+            resource_id: round(entry["amount"], 2)
+            for resource_id, entry in by_resource.items()
+        }
+
         resource_list = sorted(
             (
                 {**entry, "amount": round(entry["amount"], 2)}
@@ -3186,6 +3213,582 @@ class OCIHealthCheck:
         })
 
         return self.data["cost"]
+
+
+    # ========================================================
+    # BACKUP FRESHNESS
+    # ========================================================
+
+    def evaluate_backup_freshness(self, resources):
+        """
+        Flag volumes whose most recent backup is older than the
+        threshold.
+
+        Only the latest backup per source volume matters: a volume with
+        a gold policy legitimately keeps monthly/yearly backups that are
+        hundreds of days old, so judging each backup on its own age would
+        report thousands of false "issues". Volumes without a backup
+        policy are reported separately (Volumes & Backup Policies), so
+        they aren't double-counted here.
+        """
+
+        latest_backup = {}
+
+        for r in resources:
+            if r.get("resource_type") not in (
+                "Block Volume Backup", "Boot Volume Backup"
+            ):
+                continue
+            source_id = r.get("source_volume_id")
+            if not source_id or r.get("age_days") is None:
+                continue
+            current = latest_backup.get(source_id)
+            if current is None or r["age_days"] < current["age_days"]:
+                latest_backup[source_id] = r
+
+        issues = []
+
+        for r in resources:
+            if (
+                r.get("resource_type") not in ("Block Volume", "Boot Volume")
+                or r.get("backup_policy_status") != "ATTACHED"
+                or str(r.get("state", "")).upper() != "AVAILABLE"
+            ):
+                continue
+
+            latest = latest_backup.get(r.get("id"))
+
+            if latest is None:
+                reason = (
+                    "Backup policy is attached but no backups were found"
+                )
+            elif latest["age_days"] > self.backup_max_age_days:
+                reason = (
+                    f"Latest backup is {latest['age_days']:.1f} days old "
+                    f"(threshold {self.backup_max_age_days} days)"
+                )
+            else:
+                continue
+
+            issues.append({
+                "region": r.get("region"),
+                "compartment": r.get("compartment"),
+                "name": r.get("name"),
+                "resource_type": r.get("resource_type"),
+                "reason": reason
+            })
+
+        return issues
+
+
+    # ========================================================
+    # RECOMMENDATIONS
+    # ========================================================
+
+    def build_recommendations(self):
+        """
+        Derive prioritized, actionable recommendations from the data
+        already collected in this run. Every item is backed by concrete
+        findings (counts, names, amounts); savings figures are estimates
+        based on this tenancy's own billed amounts for the period, never
+        list prices.
+        """
+
+        data = self.data
+        summary = data["summary"]
+        cost = data["cost"]
+        resources = data["resources"]
+        currency = cost.get("currency", "USD")
+        period = self.cost_analysis_days
+        recommendations = []
+
+        def add(severity, category, title, detail, action,
+                items=None, savings=None):
+            names = [str(x) for x in (items or []) if x]
+            recommendations.append({
+                "severity": severity,
+                "category": category,
+                "title": title,
+                "detail": detail,
+                "action": action,
+                "affected_count": len(items or []),
+                "affected": names[:10],
+                "estimated_savings": (
+                    round(savings, 2) if savings else None
+                ),
+                "currency": currency
+            })
+
+        def money(amount):
+            return f"{currency} {amount:,.2f}"
+
+        def of_type(resource_type):
+            return [
+                r for r in resources
+                if r.get("resource_type") == resource_type
+            ]
+
+        instances = of_type("Compute Instance")
+        utilization_by_id = {
+            u["instance_id"]: u for u in data.get("utilization", [])
+        }
+
+        # ----------------------------------------------------
+        # COST
+        # ----------------------------------------------------
+
+        if cost.get("status") == "COLLECTED":
+
+            change_pct = summary.get("cost_change_pct")
+            if (
+                change_pct is not None
+                and change_pct >= COST_INCREASE_WARN_PERCENT
+            ):
+                by_current = cost.get("by_service_current", {})
+                by_previous = cost.get("by_service_previous", {})
+                movers = sorted(
+                    (
+                        (service, by_current.get(service, 0)
+                         - by_previous.get(service, 0))
+                        for service in set(by_current) | set(by_previous)
+                    ),
+                    key=lambda kv: kv[1],
+                    reverse=True
+                )
+                movers = [m for m in movers if m[1] > 0][:3]
+                add(
+                    "high" if change_pct >= COST_INCREASE_HIGH_PERCENT
+                    else "medium",
+                    "Cost",
+                    f"Spend up {change_pct:.1f}% versus the previous "
+                    f"{period} days",
+                    f"Total cost rose from "
+                    f"{money(summary.get('cost_previous_total', 0))} to "
+                    f"{money(summary.get('cost_total', 0))}. Largest "
+                    f"increases: " + ", ".join(
+                        f"{service} (+{money(delta)})"
+                        for service, delta in movers
+                    ) + ".",
+                    "Review resources created or resized in these "
+                    "services during the period and confirm the "
+                    "increase is expected.",
+                    items=[service for service, _ in movers]
+                )
+
+            daily = cost.get("daily", [])
+            avg_daily = summary.get("cost_avg_daily", 0)
+            spikes = [
+                p for p in daily
+                if avg_daily and p.get("amount", 0)
+                > avg_daily * COST_DAILY_SPIKE_FACTOR
+            ]
+            if spikes:
+                add(
+                    "medium",
+                    "Cost",
+                    f"{len(spikes)} day(s) with a cost spike",
+                    "Daily cost exceeded "
+                    f"{COST_DAILY_SPIKE_FACTOR}x the period average "
+                    f"({money(avg_daily)}/day) on: " + ", ".join(
+                        f"{p['date']} ({money(p['amount'])})"
+                        for p in spikes
+                    ) + ".",
+                    "Open Cost Analysis for those dates, grouped by "
+                    "service and resource, to find the one-off charge.",
+                    items=[p["date"] for p in spikes]
+                )
+
+        # Detached block volumes keep billing for storage + VPUs.
+        detached = [
+            r for r in of_type("Block Volume")
+            if r.get("attachment_status") == "DETACHED"
+        ]
+        if detached:
+            detached_gb = sum(r.get("size_gb") or 0 for r in detached)
+            savings = sum(
+                self.resource_costs.get(r["id"], 0) for r in detached
+            )
+            add(
+                "medium",
+                "Cost",
+                f"{len(detached)} detached block volume(s) "
+                f"({detached_gb:,.0f} GB)",
+                "These volumes are not attached to any instance but are "
+                "still billed for storage and performance units."
+                + (
+                    f" They cost {money(savings)} in the last "
+                    f"{period} days."
+                    if savings else ""
+                ),
+                "Confirm with the owners, take a final backup if "
+                "needed, then delete them.",
+                items=[r.get("name") for r in detached],
+                savings=savings
+            )
+
+        # Stopped instances: compute is free, attached storage isn't.
+        stopped = [r for r in instances if r.get("state") == "STOPPED"]
+        if stopped:
+            add(
+                "low",
+                "Cost",
+                f"{len(stopped)} stopped instance(s) still incur "
+                f"storage cost",
+                "Stopped instances do not bill for OCPU/memory, but "
+                "their boot and block volumes are still billed.",
+                "Terminate instances that are no longer needed (keep a "
+                "boot volume backup if required).",
+                items=[r.get("name") for r in stopped]
+            )
+
+        # Idle running instances -> rightsize or schedule.
+        idle = []
+        for r in instances:
+            u = utilization_by_id.get(r.get("id"))
+            if (
+                r.get("state") == "RUNNING"
+                and u
+                and u.get("cpu") is not None
+                and u["cpu"] < IDLE_CPU_AVG_PERCENT
+                and (u.get("cpu_peak") or 0) < IDLE_CPU_PEAK_PERCENT
+            ):
+                idle.append(r)
+        if idle:
+            idle_cost = sum(
+                self.resource_costs.get(r["id"], 0) for r in idle
+            )
+            add(
+                "medium",
+                "Cost",
+                f"{len(idle)} running instance(s) were idle all period",
+                f"Average CPU below {IDLE_CPU_AVG_PERCENT}% and never "
+                f"above {IDLE_CPU_PEAK_PERCENT}% (hourly) over the last "
+                f"{self.utilization_days} days."
+                + (
+                    f" Their compute cost for the period was "
+                    f"{money(idle_cost)}."
+                    if idle_cost else ""
+                ),
+                "Rightsize to fewer OCPUs (Flex shapes), stop them "
+                "outside business hours, or decommission them.",
+                items=[r.get("name") for r in idle],
+                # Halving OCPUs is a conservative rightsizing estimate.
+                savings=idle_cost / 2 if idle_cost else None
+            )
+
+        # Orphaned backups: the source volume no longer exists. Skipped
+        # for single-region scans, where the source volume may simply be
+        # in a region that wasn't scanned.
+        volume_ids = {
+            r.get("id") for r in resources
+            if r.get("resource_type") in ("Block Volume", "Boot Volume")
+        }
+        backups = (
+            of_type("Block Volume Backup") + of_type("Boot Volume Backup")
+        )
+        orphaned = [
+            b for b in backups
+            if b.get("source_volume_id")
+            and b["source_volume_id"] not in volume_ids
+        ]
+        if orphaned and not self.region_filter:
+            add(
+                "low",
+                "Cost",
+                f"{len(orphaned)} backup(s) of volumes that no longer "
+                f"exist",
+                f"{sum(b.get('size_gb') or 0 for b in orphaned):,.0f} GB "
+                "of backups belong to deleted volumes.",
+                "Keep only the backups required for retention or "
+                "compliance and delete the rest.",
+                items=[b.get("name") for b in orphaned]
+            )
+
+        old_backups = [
+            b for b in backups if (b.get("age_days") or 0) > 365
+        ]
+        if old_backups:
+            add(
+                "low",
+                "Cost",
+                f"{len(old_backups)} backup(s) older than one year",
+                f"{sum(b.get('size_gb') or 0 for b in old_backups):,.0f} "
+                "GB of backup storage is more than 365 days old.",
+                "Check the backup policy retention (e.g. yearly "
+                "backups in the Gold policy) against the actual "
+                "retention requirement.",
+                items=[b.get("name") for b in old_backups]
+            )
+
+        # ----------------------------------------------------
+        # SECURITY
+        # ----------------------------------------------------
+
+        cloud_guard = data.get("cloud_guard", {})
+        if cloud_guard.get("status") not in ("ENABLED", "UNAVAILABLE"):
+            add(
+                "high",
+                "Security",
+                "Cloud Guard is not enabled",
+                f"Cloud Guard status is "
+                f"'{cloud_guard.get('status')}', so misconfigurations "
+                "and suspicious activity are not being detected.",
+                "Enable Cloud Guard in the home region with the "
+                "Oracle-managed detector and responder recipes."
+            )
+        elif cloud_guard.get("problems"):
+            add(
+                "high" if cloud_guard["problems"] >= 50 else "medium",
+                "Security",
+                f"{cloud_guard['problems']} open Cloud Guard problem(s)",
+                "Cloud Guard has open findings that have not been "
+                "resolved or dismissed.",
+                "Triage the problems by risk level; remediate or "
+                "dismiss with a documented reason."
+            )
+
+        no_mfa = [
+            u for u in data.get("iam", {}).get("users", [])
+            if u.get("mfa") is False
+            and str(u.get("state", "")).upper() == "ACTIVE"
+        ]
+        if no_mfa:
+            add(
+                "high",
+                "Security",
+                f"{len(no_mfa)} active IAM user(s) without MFA",
+                "Users without multi-factor authentication are the most "
+                "common route to account compromise.",
+                "Enforce MFA for all console users (sign-on policy in "
+                "the identity domain); use API keys only for service "
+                "users.",
+                items=[u.get("name") for u in no_mfa]
+            )
+
+        public_buckets = [
+            r for r in of_type("Object Storage Bucket")
+            if r.get("public_access_type")
+            and r["public_access_type"] != "NoPublicAccess"
+        ]
+        if public_buckets:
+            add(
+                "high",
+                "Security",
+                f"{len(public_buckets)} public Object Storage bucket(s)",
+                "These buckets allow anonymous access to their objects.",
+                "Make the buckets private and share objects with "
+                "pre-authenticated requests where needed.",
+                items=[r.get("name") for r in public_buckets]
+            )
+
+        public_ip_instances = [
+            r for r in instances
+            if r.get("public_ip") not in (
+                None, "", "None", "Unknown", "No VNIC"
+            )
+        ]
+        if public_ip_instances:
+            add(
+                "low",
+                "Security",
+                f"{len(public_ip_instances)} instance(s) with a public IP",
+                "Instances exposed directly to the internet increase "
+                "the attack surface.",
+                "Confirm each needs a public IP; restrict ingress with "
+                "NSGs/security lists, or move behind a load balancer, "
+                "WAF or the Bastion service.",
+                items=[r.get("name") for r in public_ip_instances]
+            )
+
+        # ----------------------------------------------------
+        # RELIABILITY
+        # ----------------------------------------------------
+
+        no_policy = [
+            r for r in resources
+            if r.get("resource_type") in ("Block Volume", "Boot Volume")
+            and r.get("backup_policy_status") == "NOT_ATTACHED"
+        ]
+        if no_policy:
+            add(
+                "medium",
+                "Reliability",
+                f"{len(no_policy)} volume(s) without a backup policy",
+                "These volumes have no scheduled backups, so data "
+                "cannot be restored after deletion or corruption.",
+                "Attach a Bronze/Silver/Gold or custom backup policy, "
+                "or document why the volume does not need backups.",
+                items=[r.get("name") for r in no_policy]
+            )
+
+        if data.get("backup_issues"):
+            add(
+                "medium",
+                "Reliability",
+                f"{len(data['backup_issues'])} volume(s) with stale "
+                f"backups",
+                f"The latest backup is older than "
+                f"{self.backup_max_age_days} days even though a backup "
+                "policy is attached.",
+                "Check the policy schedule and the Block Volume "
+                "work requests for failed backup jobs.",
+                items=[i.get("name") for i in data["backup_issues"]]
+            )
+
+        faulty = [
+            r for r in data.get("replication", [])
+            if str(r.get("state", "")).upper()
+            not in ["AVAILABLE", "RUNNING", "ACTIVE"]
+        ]
+        if faulty:
+            add(
+                "high",
+                "Reliability",
+                f"{len(faulty)} volume replica(s) not healthy",
+                "Cross-region replicas are not in an available state, "
+                "so DR recovery points may be missing.",
+                "Check replication status in the DR region and "
+                "re-enable replication if required.",
+                items=[r.get("name") for r in faulty]
+            )
+
+        # ----------------------------------------------------
+        # PERFORMANCE
+        # ----------------------------------------------------
+
+        name_by_id = {r.get("id"): r.get("name") for r in instances}
+
+        for label, key, threshold in [
+            ("CPU", "cpu", CPU_HIGH_PERCENT),
+            ("memory", "memory", MEMORY_HIGH_PERCENT),
+            ("disk", "disk", DISK_HIGH_PERCENT)
+        ]:
+            hot = [
+                u for u in data.get("utilization", [])
+                if u.get(key) is not None and u[key] >= threshold
+            ]
+            if hot:
+                add(
+                    "high",
+                    "Performance",
+                    f"{len(hot)} instance(s) with sustained high "
+                    f"{label} usage",
+                    f"Average {label} utilization was at or above "
+                    f"{threshold}% across the last "
+                    f"{self.utilization_days} days.",
+                    "Clean up or extend the file system before it fills "
+                    "up."
+                    if key == "disk" else
+                    "Scale up (more OCPUs/memory) or investigate the "
+                    "workload before it causes an outage.",
+                    items=[
+                        name_by_id.get(u["instance_id"], u["instance_id"])
+                        for u in hot
+                    ]
+                )
+
+        no_metrics = [
+            r for r in instances
+            if r.get("state") == "RUNNING"
+            and utilization_by_id.get(r.get("id"), {}).get("cpu") is None
+        ]
+        if no_metrics:
+            add(
+                "low",
+                "Operations",
+                f"{len(no_metrics)} running instance(s) report no "
+                f"metrics",
+                "No CPU data was returned for these instances, so they "
+                "cannot be monitored or rightsized.",
+                "Enable the Compute Instance Monitoring plugin in the "
+                "Oracle Cloud Agent and allow the instance to reach the "
+                "monitoring endpoint (service gateway).",
+                items=[r.get("name") for r in no_metrics]
+            )
+
+        # ----------------------------------------------------
+        # OPERATIONS
+        # ----------------------------------------------------
+
+        alarms = data.get("alarms", [])
+        firing = [
+            a for a in alarms
+            if str(a.get("status", "")).upper() == "FIRING"
+        ]
+        if firing:
+            add(
+                "high",
+                "Operations",
+                f"{len(firing)} alarm(s) currently firing",
+                "These alarms are in the FIRING state now.",
+                "Investigate each alarm and resolve the underlying "
+                "condition.",
+                items=[a.get("name") for a in firing]
+            )
+
+        if instances and len(alarms) < max(1, len(instances) // 10):
+            add(
+                "medium",
+                "Operations",
+                f"Limited alarm coverage ({len(alarms)} alarm(s) for "
+                f"{len(instances)} instance(s))",
+                "Without alarms, outages and capacity problems are only "
+                "found when users report them.",
+                "Create alarms for CPU, memory, disk, instance health "
+                "and load balancer backend health, routed to a "
+                "Notifications topic monitored by the operations team."
+            )
+
+        no_data_alarms = [
+            a for a in alarms
+            if str(a.get("status", "")).upper() == "NO DATA"
+        ]
+        if no_data_alarms:
+            add(
+                "low",
+                "Operations",
+                f"{len(no_data_alarms)} alarm(s) receiving no data",
+                "These alarms cannot fire because their metric query "
+                "returns nothing (wrong resource name, or the metric "
+                "is not emitted).",
+                "Fix the alarm query or remove the alarm.",
+                items=[a.get("name") for a in no_data_alarms]
+            )
+
+        action_required = [
+            a for a in data.get("announcements", [])
+            if a.get("type") in ("ACTION_REQUIRED", "ACTION_RECOMMENDED")
+        ]
+        if action_required:
+            add(
+                "medium",
+                "Operations",
+                f"{len(action_required)} OCI announcement(s) requiring "
+                f"action",
+                "Oracle published announcements in the last "
+                f"{self.announcement_days} days that need customer "
+                "action (e.g. upgrades, certificate or image changes).",
+                "Review each announcement and schedule the required "
+                "change before its deadline.",
+                items=[a.get("title") for a in action_required]
+            )
+
+        if self.errors:
+            add(
+                "low",
+                "Operations",
+                f"{len(self.errors)} data collection error(s)",
+                "Some sections of this report may be incomplete.",
+                "See the Collection Errors section; most are fixed by "
+                "granting the reporting user read access to the "
+                "affected service.",
+                items=sorted({str(e.get("section")) for e in self.errors})
+            )
+
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        recommendations.sort(key=lambda r: severity_rank[r["severity"]])
+
+        return recommendations
 
 
     # ========================================================
@@ -3276,7 +3879,9 @@ class OCIHealthCheck:
 
         print("")
         print("=" * 70)
-        print("OCI DAILY HEALTH CHECK")
+        print(
+            f"OCI HEALTH CHECK - LAST {self.cost_analysis_days} DAYS"
+        )
         print("=" * 70)
         print("")
 
@@ -3406,7 +4011,17 @@ class OCIHealthCheck:
 
         self.data["resources"] = total_resources
 
+        self.data["backup_issues"] = self.evaluate_backup_freshness(
+            total_resources
+        )
+
         self.collect_cost()
+
+        for resource in total_resources:
+            if resource.get("id") in self.resource_costs:
+                resource["period_cost"] = self.resource_costs[
+                    resource["id"]
+                ]
 
         # ----------------------------------------------------
         # Summary
@@ -3431,19 +4046,19 @@ class OCIHealthCheck:
         high_cpu = [
             item for item in self.data["utilization"]
             if item.get("cpu") is not None
-            and item["cpu"] >= 80
+            and item["cpu"] >= CPU_HIGH_PERCENT
         ]
 
         high_memory = [
             item for item in self.data["utilization"]
             if item.get("memory") is not None
-            and item["memory"] >= 85
+            and item["memory"] >= MEMORY_HIGH_PERCENT
         ]
 
         high_disk = [
             item for item in self.data["utilization"]
             if item.get("disk") is not None
-            and item["disk"] >= 80
+            and item["disk"] >= DISK_HIGH_PERCENT
         ]
 
         faulty_replicas = [
@@ -3532,10 +4147,7 @@ class OCIHealthCheck:
             highest_day = {"date": "N/A", "amount": 0}
             lowest_day = {"date": "N/A", "amount": 0}
 
-        cost_by_resource_ids = {
-            entry["resource_id"]: entry["amount"]
-            for entry in cost_data.get("by_resource", [])
-        }
+        cost_by_resource_ids = self.resource_costs
 
         new_resources_in_period = [
             r for r in total_resources
@@ -3906,7 +4518,7 @@ class OCIHealthCheck:
 
         self.data["metadata"] = {
             "report_name":
-                f"OCI Daily Health Report - "
+                f"OCI Weekly Health Report - "
                 f"{self.customer_name}",
 
             "customer_name":
@@ -3932,8 +4544,29 @@ class OCIHealthCheck:
                 self.announcement_days,
 
             "backup_max_age_days":
-                self.backup_max_age_days
+                self.backup_max_age_days,
+
+            "utilization_days":
+                self.utilization_days,
+
+            "cost_analysis_days":
+                self.cost_analysis_days,
+
+            "period_start":
+                self.data["cost"].get("start_date"),
+
+            "period_end":
+                self.data["cost"].get("end_date")
         }
+
+        self.data["recommendations"] = self.build_recommendations()
+        self.data["summary"]["recommendations"] = len(
+            self.data["recommendations"]
+        )
+        self.data["summary"]["high_priority_recommendations"] = len([
+            r for r in self.data["recommendations"]
+            if r["severity"] == "high"
+        ])
 
         return self.data
 
@@ -3941,6 +4574,18 @@ class OCIHealthCheck:
 # ============================================================
 # HTML REPORT
 # ============================================================
+
+def format_utilization(average, peak):
+    """Render "avg / peak" for a utilization cell, or N/A."""
+    if average is None:
+        return "N/A"
+    if peak is None:
+        return html_escape(average)
+    return (
+        f'{html_escape(average)} '
+        f'<span class="muted">/ {html_escape(peak)}</span>'
+    )
+
 
 def html_escape(value):
 
@@ -4476,6 +5121,7 @@ def _render_cost_trend_line_matplotlib(daily_points, currency):
 def reorder_html_sections(html):
 
     section_order = [
+        "recommendations",
         "region-overview",
         "compartments",
         "iam-security",
@@ -4807,7 +5453,9 @@ def generate_html(data, filename):
 <td>{html_escape(r.get("time_created", "")[:10])}</td>
 <td>{html_escape(r.get("compartment"))}</td>
 <td>{
-    (cost_symbol + format(by_resource_amounts[r["id"]], ",.2f"))
+    (cost_symbol + format(r["period_cost"], ",.2f"))
+    if r.get("period_cost") is not None
+    else (cost_symbol + format(by_resource_amounts[r["id"]], ",.2f"))
     if r.get("id") in by_resource_amounts
     else "Not separately billed"
 }</td>
@@ -4821,100 +5469,80 @@ def generate_html(data, filename):
     )
 
     # ----------------------------------------------------
-    # Cost-specific optimization recommendations -- derived only
-    # from real, already-collected data (detached volumes, stopped
-    # instances), never fabricated dollar guarantees.
+    # Recommendations -- built during collection (see
+    # OCIHealthCheck.build_recommendations) so the JSON output carries
+    # the same list. The full list renders in its own section; the
+    # cost subset is repeated in the Billing section.
     # ----------------------------------------------------
 
-    detached_volumes = [
-        r for r in data.get("resources", [])
-        if r.get("resource_type") == "Block Volume"
-        and r.get("attachment_status") == "DETACHED"
-    ]
+    recommendations = data.get("recommendations", [])
 
-    detached_volume_gb = sum(
-        r.get("size_gb", 0) or 0 for r in detached_volumes
-    )
-
-    block_storage_service_cost = by_service_current.get(
-        "Block Storage", 0
-    )
-
-    total_block_gb = summary.get("total_block_storage_tb", 0) * 1024
-
-    estimated_gb_rate = (
-        block_storage_service_cost / total_block_gb
-        if total_block_gb else None
-    )
-
-    detached_volume_savings = (
-        round(detached_volume_gb * estimated_gb_rate, 2)
-        if estimated_gb_rate is not None
-        else None
-    )
-
-    stopped_instances = [
-        r for r in data.get("resources", [])
-        if r.get("resource_type") == "Compute Instance"
-        and r.get("state") == "STOPPED"
-    ]
-
-    cost_recommendations = []
-
-    if detached_volumes:
-        savings_text = (
-            f" (roughly {cost_symbol}{detached_volume_savings:,.2f}/"
-            f"period, based on this tenancy's average block storage "
-            f"rate)"
-            if detached_volume_savings is not None
-            else ""
-        )
-        cost_recommendations.append((
-            "medium",
-            f"{len(detached_volumes)} block volume(s) totalling "
-            f"{detached_volume_gb:,.0f} GB are detached from any "
-            f"instance and still incurring storage cost{savings_text}. "
-            f"Validate with the application owner before deleting."
-        ))
-
-    if stopped_instances:
-        cost_recommendations.append((
-            "medium",
-            f"{len(stopped_instances)} instance(s) are stopped but "
-            f"their boot/block volumes are still billed. Confirm "
-            f"whether they're still needed, or terminate to stop the "
-            f"storage charge."
-        ))
-
-    if cost_top_increase_amount := summary.get(
-        "cost_top_increase_amount", 0
-    ):
-        if cost_top_increase_amount > 0:
-            cost_recommendations.append((
-                "low",
-                f"{html_escape(summary.get('cost_top_increase_service'))} "
-                f"had the largest cost increase versus the previous "
-                f"period ({cost_symbol}"
-                f"{cost_top_increase_amount:,.2f}) -- review recent "
-                f"changes to resources in this service."
-            ))
-
-    if not cost_recommendations:
-        cost_recommendations.append((
-            "good",
-            "No specific cost-optimization opportunities were "
-            "identified from the available data for this period."
-        ))
-
-    cost_recommendations_html = "".join(
-        f"""
+    def render_recommendations(items, empty_text):
+        if not items:
+            return f"""
 <div class="recommendation-item">
-<span class="recommendation-dot {severity}"></span>
-<span>{html_escape(text)}</span>
+<span class="recommendation-dot good"></span>
+<span>{html_escape(empty_text)}</span>
 </div>
 """
-        for severity, text in cost_recommendations
+        rendered = ""
+        for rec in items:
+            affected = ""
+            if rec.get("affected"):
+                more = rec.get("affected_count", 0) - len(rec["affected"])
+                affected = (
+                    '<div class="recommendation-affected">Affected: '
+                    + html_escape(", ".join(rec["affected"]))
+                    + (f" and {more} more" if more > 0 else "")
+                    + "</div>"
+                )
+            savings = ""
+            if rec.get("estimated_savings"):
+                savings = (
+                    '<div class="recommendation-savings">Estimated '
+                    f'saving: {cost_symbol}'
+                    f'{rec["estimated_savings"]:,.2f} per '
+                    f'{summary.get("cost_period_days", 0)} days</div>'
+                )
+            rendered += f"""
+<div class="recommendation-item">
+<span class="recommendation-dot {html_escape(rec["severity"])}"></span>
+<div>
+<div class="recommendation-title">
+<span class="recommendation-badge {html_escape(rec["severity"])}">{html_escape(rec["severity"].upper())}</span>
+<span class="recommendation-category">{html_escape(rec["category"])}</span>
+{html_escape(rec["title"])}
+</div>
+<div>{html_escape(rec["detail"])}</div>
+<div class="recommendation-action"><strong>Action:</strong> {html_escape(rec["action"])}</div>
+{affected}
+{savings}
+</div>
+</div>
+"""
+        return rendered
+
+    all_recommendations_html = render_recommendations(
+        recommendations,
+        "No issues requiring action were identified for this period."
     )
+
+    cost_recommendations_html = render_recommendations(
+        [r for r in recommendations if r.get("category") == "Cost"],
+        "No specific cost-optimization opportunities were identified "
+        "from the available data for this period."
+    )
+
+    recommendation_counts = {
+        severity: len([
+            r for r in recommendations if r.get("severity") == severity
+        ])
+        for severity in ("high", "medium", "low")
+    }
+
+    total_estimated_savings = round(sum(
+        r.get("estimated_savings") or 0 for r in recommendations
+    ), 2)
 
     # ----------------------------------------------------
     # Executive cost summary paragraph
@@ -5319,6 +5947,49 @@ td {{
 .recommendation-dot.low {{ background: var(--zt-navy); }}
 .recommendation-dot.good {{ background: #2e7d32; }}
 
+.recommendation-title {{
+    font-weight: 600;
+    margin-bottom: 2px;
+}}
+
+.recommendation-badge {{
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: 6px;
+    color: #ffffff;
+    vertical-align: 1px;
+}}
+
+.recommendation-badge.high {{ background: #c62828; }}
+.recommendation-badge.medium {{ background: #ef6c00; }}
+.recommendation-badge.low {{ background: var(--zt-navy); }}
+
+.recommendation-category {{
+    color: var(--zt-muted);
+    font-weight: 500;
+    margin-right: 6px;
+}}
+
+.recommendation-action {{
+    margin-top: 4px;
+}}
+
+.recommendation-affected,
+.recommendation-savings {{
+    margin-top: 4px;
+    color: var(--zt-muted);
+    font-size: 12px;
+}}
+
+.recommendation-savings {{
+    color: var(--zt-success);
+    font-weight: 600;
+}}
+
 .muted {{
     color: var(--zt-muted);
     font-size: 13px;
@@ -5364,6 +6035,7 @@ ZainTECH <span>&bull;</span> Managed Services <span>&bull;</span> Cloud Health R
 
 <p>
 Prepared for: {html_escape(data["metadata"]["customer_name"])} |
+Reporting period: {html_escape(data["metadata"].get("period_start"))} to {html_escape(data["metadata"].get("period_end"))} |
 Generated: {html_escape(generated)}
 </p>
 
@@ -5384,6 +6056,7 @@ Confidential &mdash; Prepared exclusively for {html_escape(data["metadata"]["cus
 Contents
 </div>
 
+<a href="#recommendations"><span class="toc-number">&#9733;</span>Key Findings &amp; Recommendations</a>
 <a href="#region-overview"><span class="toc-number">01</span>Region Overview &amp; Infra Summary</a>
 <a href="#compartments"><span class="toc-number">02</span>Compartments</a>
 <a href="#iam-security"><span class="toc-number">03</span>IAM &amp; Security</a>
@@ -5981,8 +6654,12 @@ Healthy replicas are in AVAILABLE state. Faulty or other states require investig
 </h2>
 
 <p class="section-intro">
-{summary["cost_period_days"]}-day OCI cost analysis for the tenancy's
-home region, compared against the previous comparable period.
+OCI cost for the last {summary["cost_period_days"]} full days
+({html_escape(data["metadata"].get("period_start"))} to
+{html_escape(data["metadata"].get("period_end"))}, UTC, tenancy-wide),
+compared with the {summary["cost_period_days"]} days before it. OCI
+usage data can lag by up to 24 hours, so the most recent day may be
+slightly understated.
 </p>
 
 <p>
@@ -6008,7 +6685,7 @@ Status: {html_escape(summary["cost_status"])}
 </div>
 
 <div class="card">
-<div class="title">Cost Change</div>
+<div class="title">Change vs Previous {summary["cost_period_days"]} Days</div>
 <div class="value {'danger' if summary['cost_change'] > 0 else 'healthy'}">{cost_symbol}{summary["cost_change"]:+,.2f}</div>
 </div>
 
@@ -6115,6 +6792,54 @@ compartment instead -- the most reliable dimensions available. Adding
 standardized tags would enable a full per-application cost breakdown
 in future reports.
 </p>
+
+</div>
+
+
+<!-- ================================================== -->
+<!-- RECOMMENDATIONS -->
+<!-- ================================================== -->
+
+<div id="recommendations" class="section">
+
+<h2>
+Key Findings &amp; Recommendations
+</h2>
+
+<p class="section-intro">
+Prioritized actions derived from this week's data
+({html_escape(data["metadata"].get("period_start"))} to
+{html_escape(data["metadata"].get("period_end"))}). High-priority items
+should be addressed first.
+</p>
+
+<div class="cards">
+
+<div class="card">
+<div class="title">High Priority</div>
+<div class="value {'danger' if recommendation_counts['high'] else 'healthy'}">{recommendation_counts["high"]}</div>
+</div>
+
+<div class="card">
+<div class="title">Medium Priority</div>
+<div class="value {'warning' if recommendation_counts['medium'] else 'healthy'}">{recommendation_counts["medium"]}</div>
+</div>
+
+<div class="card">
+<div class="title">Low Priority</div>
+<div class="value">{recommendation_counts["low"]}</div>
+</div>
+
+<div class="card">
+<div class="title">Est. Savings / {summary["cost_period_days"]} days</div>
+<div class="value">{cost_symbol}{total_estimated_savings:,.2f}</div>
+</div>
+
+</div>
+
+<div class="recommendations-panel">
+{all_recommendations_html}
+</div>
 
 </div>
 
@@ -6346,8 +7071,10 @@ Users, groups, and policies configured at the tenancy level.
 </h2>
 
 <p class="section-intro">
-All compute instances found, with OS, networking, and live
-utilization for running instances.
+All compute instances found, with OS, networking, and utilization
+for running instances over the last
+{data["metadata"].get("utilization_days", 7)} days, shown as
+average / peak (highest hourly mean).
 </p>
 
 <div class="cards">
@@ -6380,9 +7107,9 @@ utilization for running instances.
 <th>OS</th>
 <th>Private IP</th>
 <th>Public IP</th>
-<th>CPU %</th>
-<th>Memory %</th>
-<th>Disk %</th>
+<th>CPU % (avg / peak)</th>
+<th>Memory % (avg / peak)</th>
+<th>Disk % (avg / peak)</th>
 </tr>
 """
 
@@ -6430,21 +7157,21 @@ utilization for running instances.
 </td>
 
 <td class="
-{'danger' if resource.get("cpu_percent") is not None and resource.get("cpu_percent") >= 80 else ''}
+{'danger' if resource.get("cpu_percent") is not None and resource.get("cpu_percent") >= CPU_HIGH_PERCENT else ''}
 ">
-{html_escape(resource.get("cpu_percent"))}
+{format_utilization(resource.get("cpu_percent"), resource.get("cpu_peak_percent"))}
 </td>
 
 <td class="
-{'danger' if resource.get("memory_percent") is not None and resource.get("memory_percent") >= 85 else ''}
+{'danger' if resource.get("memory_percent") is not None and resource.get("memory_percent") >= MEMORY_HIGH_PERCENT else ''}
 ">
-{html_escape(resource.get("memory_percent"))}
+{format_utilization(resource.get("memory_percent"), resource.get("memory_peak_percent"))}
 </td>
 
 <td class="
-{'danger' if resource.get("disk_percent") is not None and resource.get("disk_percent") >= 80 else ''}
+{'danger' if resource.get("disk_percent") is not None and resource.get("disk_percent") >= DISK_HIGH_PERCENT else ''}
 ">
-{html_escape(resource.get("disk_percent"))}
+{format_utilization(resource.get("disk_percent"), resource.get("disk_peak_percent"))}
 </td>
 
 </tr>
@@ -7062,7 +7789,8 @@ def run_profile(args, profile, multiple_profiles=False):
             config_file=args.config_file,
             max_workers=args.max_workers,
             customer_name=args.customer_name,
-            cost_analysis_days=args.cost_days
+            cost_analysis_days=args.cost_days,
+            utilization_days=args.utilization_days
         )
 
         data = checker.collect()
@@ -7114,9 +7842,33 @@ def run_profile(args, profile, multiple_profiles=False):
             ("Regions Scanned", summary["regions_scanned"]),
             ("Compartments", summary["compartments"]),
             ("Resources", summary["total_resources"]),
-            ("Collection Errors", summary["collection_errors"])
+            ("Collection Errors", summary["collection_errors"]),
+            (
+                f"Cost ({summary['cost_period_days']} days)",
+                f"{summary['cost_currency']} {summary['cost_total']:,.2f}"
+                + (
+                    f" ({summary['cost_change_pct']:+.1f}% vs previous)"
+                    if summary.get("cost_change_pct") is not None
+                    else ""
+                )
+            ),
+            (
+                "Recommendations",
+                f"{summary['recommendations']} "
+                f"({summary['high_priority_recommendations']} high)"
+            )
         ]:
             print(f"{label:<20}: {value}")
+
+        high = [
+            r for r in data.get("recommendations", [])
+            if r["severity"] == "high"
+        ]
+        if high:
+            print("")
+            print("High-priority recommendations:")
+            for rec in high:
+                print(f"  - [{rec['category']}] {rec['title']}")
 
         print("")
         print(f"HTML Report : {html_file}")
@@ -7139,7 +7891,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=
-        "OCI Daily Health Check"
+        "OCI Weekly Health Check"
     )
 
     parser.add_argument(
@@ -7170,28 +7922,48 @@ def main():
     )
 
     parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_REPORT_PERIOD_DAYS,
+        help=(
+            "Reporting period in days for cost, utilization, "
+            "announcements and new resources (default: "
+            f"{DEFAULT_REPORT_PERIOD_DAYS}, i.e. weekly; max 90)"
+        )
+    )
+
+    parser.add_argument(
         "--announcement-days",
         type=int,
-        default=30,
-        help="Number of days of announcements"
+        default=None,
+        help="Override the announcement window (default: --days)"
     )
 
     parser.add_argument(
         "--backup-age",
         type=int,
-        default=2,
-        help=
-        "Backup age threshold in days"
+        default=DEFAULT_BACKUP_MAX_AGE_DAYS,
+        help=(
+            "Flag a volume when its latest backup is older than this "
+            "many days"
+        )
     )
 
     parser.add_argument(
         "--cost-days",
         type=int,
-        default=DEFAULT_COST_ANALYSIS_DAYS,
+        default=None,
         help=(
-            "Number of days for the cost analysis period (also used "
-            "for the comparable previous period; max 90)"
+            "Override the cost analysis period (default: --days). The "
+            "previous period of the same length is used for comparison"
         )
+    )
+
+    parser.add_argument(
+        "--utilization-days",
+        type=int,
+        default=None,
+        help="Override the utilization metrics window (default: --days)"
     )
 
     parser.add_argument(
@@ -7218,6 +7990,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if not 1 <= args.days <= 90:
+        parser.error("--days must be between 1 and 90")
+
+    for option in ("announcement_days", "cost_days", "utilization_days"):
+        if getattr(args, option) is None:
+            setattr(args, option, args.days)
 
 
     os.makedirs(
