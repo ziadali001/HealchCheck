@@ -7,8 +7,9 @@ recipient only. It does not send reports to an EMICOOL customer address.
 
 ## When it runs
 
-The **Generate EMICOOL OCI health report** workflow runs every day at 06:00 UTC
-and can also be started from the **Actions** tab with **Run workflow**. Each run
+The **Generate EMICOOL OCI health report** workflow runs every day at 08:00 Cairo
+time (Africa/Cairo, DST-aware: 05:00 UTC in summer, 06:00 UTC in winter; GitHub
+may start scheduled runs a few minutes late) and can also be started from the **Actions** tab with **Run workflow**. Each run
 uploads the generated files as an artifact named
 `emicool-oci-health-report-<run number>` and retains it for 30 days.
 
@@ -29,8 +30,9 @@ these repository secrets:
 ## Test-email configuration
 
 Successful reports are emailed from `ziad.cee@gmail.com` to
-`zma.cee@gmail.com` with the subject `TEST — EMICOOL OCI daily
-health report`. The HTML and JSON reports are attached. There are no customer
+`zma.cee@gmail.com` as a ZainTech-branded HTML email with the
+subject `EMICOOL | OCI Daily Health Report | <date> | <status>`. The HTML and
+JSON reports are attached as one zip. There are no customer
 recipients in the workflow.
 
 Configure the following before the first run:

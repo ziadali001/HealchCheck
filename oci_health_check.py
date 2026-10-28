@@ -2507,6 +2507,12 @@ class OCIHealthCheck:
         # Users
         # ----------------------------------------------------
 
+        # The classic IAM ListUsers API keeps reporting lifecycle_state
+        # ACTIVE for users deactivated in an identity domain, while the
+        # OCI Console shows them as Inactive (driven by the domain's
+        # SCIM `active` flag), so the domain status is authoritative.
+        domain_active_by_ocid = self.collect_domain_user_status()
+
         try:
 
             users = self.get_all(
@@ -2515,6 +2521,15 @@ class OCIHealthCheck:
             )
 
             for user in users:
+
+                user_state = lifecycle(user)
+
+                if domain_active_by_ocid.get(user.id) is False:
+                    user_state = "INACTIVE"
+                elif getattr(user, "inactive_status", None):
+                    # Non-zero bitmask: suspended, disabled, blocked or
+                    # locked -- all shown as Inactive in the Console.
+                    user_state = "INACTIVE"
 
                 try:
                     memberships = self.get_all(
@@ -2543,8 +2558,7 @@ class OCIHealthCheck:
                         )
                     ),
                     "id": user.id,
-                    "state":
-                        lifecycle(user),
+                    "state": user_state,
                     "email":
                         safe(
                             getattr(
@@ -2586,6 +2600,73 @@ class OCIHealthCheck:
         self.data["iam"] = iam
 
         return iam
+
+
+    def collect_domain_user_status(self):
+        """Map user OCID -> SCIM `active` flag across identity domains."""
+
+        active_by_ocid = {}
+
+        try:
+            domains = self.get_all(
+                self.identity.list_domains,
+                compartment_id=self.tenancy_id,
+                lifecycle_state="ACTIVE"
+            )
+        except Exception as exc:
+            self.record_error(
+                "IAM Identity Domains",
+                self.home_region,
+                "ROOT",
+                exc
+            )
+            return active_by_ocid
+
+        for domain in domains:
+
+            try:
+                client = oci.identity_domains.IdentityDomainsClient(
+                    self.config,
+                    service_endpoint=domain.url,
+                    retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY,
+                    timeout=OCI_CLIENT_TIMEOUT
+                )
+
+                start_index = 1
+                page_size = 500
+
+                while True:
+                    page = client.list_users(
+                        attributes="ocid,userName,active",
+                        start_index=start_index,
+                        count=page_size
+                    ).data
+
+                    resources = page.resources or []
+
+                    for domain_user in resources:
+                        if domain_user.ocid:
+                            active_by_ocid[domain_user.ocid] = (
+                                domain_user.active is not False
+                            )
+
+                    start_index += len(resources)
+
+                    if (
+                        not resources
+                        or start_index > (page.total_results or 0)
+                    ):
+                        break
+
+            except Exception as exc:
+                self.record_error(
+                    "IAM Domain Users",
+                    self.home_region,
+                    get_name(domain),
+                    exc
+                )
+
+        return active_by_ocid
 
 
     # ========================================================
@@ -7022,6 +7103,12 @@ Users, groups, and policies configured at the tenancy level.
             user.get("groups", [])
         ) or "None"
 
+        state_class = (
+            "badge-good"
+            if str(user["state"]).upper() == "ACTIVE"
+            else "badge-bad"
+        )
+
         html += f"""
 
 <tr>
@@ -7035,7 +7122,11 @@ Users, groups, and policies configured at the tenancy level.
 </td>
 
 <td>
+
+<span class="badge {state_class}">
 {html_escape(user["state"])}
+</span>
+
 </td>
 
 <td>

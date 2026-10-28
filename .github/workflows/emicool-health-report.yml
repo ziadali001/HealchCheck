@@ -3,8 +3,12 @@ name: Generate EMICOOL OCI health report
 on:
   workflow_dispatch:
   schedule:
-    # Runs daily at 06:00 UTC. GitHub schedules run from the default branch.
-    - cron: "0 6 * * *"
+    # Target: 08:00 Africa/Cairo daily. GitHub cron is UTC-only and Cairo
+    # observes DST (UTC+3 in summer, UTC+2 in winter), so both candidate
+    # times are scheduled and the cairo-window job keeps only the one that
+    # matches today's offset. GitHub schedules run from the default branch.
+    - cron: "0 5 * * *" # 08:00 Cairo during summer time (UTC+3)
+    - cron: "0 6 * * *" # 08:00 Cairo during winter time (UTC+2)
 
 permissions:
   contents: read
@@ -14,8 +18,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  cairo-window:
+    name: Check 08:00 Cairo delivery window
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.window.outputs.run }}
+    steps:
+      - name: Match schedule to Cairo UTC offset
+        id: window
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" != "schedule" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # The scheduled time (not the actual start time) is compared,
+          # so GitHub's queueing delays never cause a skipped day.
+          cairo_offset="$(TZ=Africa/Cairo date +%z)"
+          case "${cairo_offset}" in
+            +0300) expected_schedule="0 5 * * *" ;;
+            +0200) expected_schedule="0 6 * * *" ;;
+            *)
+              echo "::error::Unexpected Africa/Cairo offset ${cairo_offset}."
+              exit 1
+              ;;
+          esac
+
+          if [[ "${EVENT_SCHEDULE}" == "${expected_schedule}" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Skipping: '${EVENT_SCHEDULE}' is not 08:00 Cairo today (offset ${cairo_offset})."
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   generate-report:
     name: Generate EMICOOL report
+    needs: cairo-window
+    if: needs.cairo-window.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -91,7 +136,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Email test report to Ziad
+      - name: Email report to Ziad
         if: success()
         env:
           REPORT_TEST_RECIPIENT: Ziad.Abdelrazek@zaintech.com
