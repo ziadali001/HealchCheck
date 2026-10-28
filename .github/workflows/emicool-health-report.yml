@@ -1,19 +1,30 @@
 name: Generate EMICOOL OCI health report
+run-name: >-
+  ${{ inputs.scheduled_delivery
+  && 'EMICOOL daily 08:00 delivery'
+  || 'Generate EMICOOL OCI health report' }}
 
 on:
+  # Primary trigger: an external scheduler calls the workflow_dispatch API
+  # at 07:00 Africa/Cairo with scheduled_delivery=true (see README.md).
+  # Dispatched runs start within seconds, unlike GitHub's own cron, which
+  # has been starting this workflow 4-6 hours late.
   workflow_dispatch:
     inputs:
+      scheduled_delivery:
+        description: "Daily delivery: hold the email until 08:00 Cairo, then send"
+        type: boolean
+        default: false
       send_email:
-        description: "Email the report now (scheduled runs always email at 08:00 Cairo)"
+        description: "Email the report as soon as it is generated"
         type: boolean
         default: false
   schedule:
-    # The report is generated from 07:00 Africa/Cairo and the email is held
-    # until exactly 08:00 Cairo, absorbing GitHub's scheduling delays and
-    # the report generation time. GitHub cron is UTC-only and Cairo
-    # observes DST (UTC+3 in summer, UTC+2 in winter), so both candidate
-    # times are scheduled and the cairo-window job keeps only the one that
-    # matches today's offset. GitHub schedules run from the default branch.
+    # Backup only: sends the report if today's dispatched 08:00 delivery
+    # did not succeed. GitHub cron is UTC-only and Cairo observes DST
+    # (UTC+3 in summer, UTC+2 in winter), so both candidate times are
+    # scheduled and the cairo-window job keeps only the one that matches
+    # today's offset. GitHub schedules run from the default branch.
     - cron: "0 4 * * *" # 07:00 Cairo during summer time (UTC+3)
     - cron: "0 5 * * *" # 07:00 Cairo during winter time (UTC+2)
 
@@ -28,6 +39,8 @@ jobs:
   cairo-window:
     name: Check Cairo schedule window
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     outputs:
       run: ${{ steps.window.outputs.run }}
     steps:
@@ -37,6 +50,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -57,11 +72,30 @@ jobs:
               ;;
           esac
 
-          if [[ "${EVENT_SCHEDULE}" == "${expected_schedule}" ]]; then
-            echo "run=true" >> "${GITHUB_OUTPUT}"
-          else
+          if [[ "${EVENT_SCHEDULE}" != "${expected_schedule}" ]]; then
             echo "Skipping: '${EVENT_SCHEDULE}' is not 07:00 Cairo today (offset ${cairo_offset})."
             echo "run=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip the backup when today's 08:00 delivery already succeeded
+          # or is still running, so the report is never emailed twice.
+          cairo_midnight="$(TZ=Africa/Cairo date -d 'today 00:00' +%s)"
+          delivered_today="$(
+            gh run list               --workflow emicool-health-report.yml               --event workflow_dispatch               --limit 50               --json displayTitle,status,conclusion,createdAt             | jq --argjson since "${cairo_midnight}" '[
+                .[]
+                | select(.displayTitle == "EMICOOL daily 08:00 delivery")
+                | select((.createdAt | fromdateiso8601) >= $since)
+                | select(.status != "completed" or .conclusion == "success")
+              ] | length'
+          )"
+
+          if (( delivered_today > 0 )); then
+            echo "Skipping backup: today's 08:00 delivery already ran."
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::No 08:00 delivery found today; sending backup report."
+            echo "run=true" >> "${GITHUB_OUTPUT}"
           fi
 
   generate-report:
@@ -145,7 +179,7 @@ jobs:
           retention-days: 30
 
       - name: Wait until 08:00 Cairo
-        if: success() && github.event_name == 'schedule'
+        if: success() && inputs.scheduled_delivery
         shell: bash
         run: |
           set -euo pipefail
@@ -158,11 +192,15 @@ jobs:
             echo "Holding the email for ${wait_seconds}s until 08:00 Cairo."
             sleep "${wait_seconds}"
           else
-            echo "::warning::Report finished after 08:00 Cairo; sending now."
+            echo "::warning::Report finished after 08:00 Cairo; sending now. Start the external trigger earlier."
           fi
 
       - name: Email report to Ziad
-        if: success() && (github.event_name == 'schedule' || inputs.send_email)
+        if: >-
+          success()
+          && (github.event_name == 'schedule'
+          || inputs.scheduled_delivery
+          || inputs.send_email)
         env:
           REPORT_TEST_RECIPIENT: Ziad.Abdelrazek@zaintech.com
           REPORT_SENDER: ziad.cee@gmail.com
