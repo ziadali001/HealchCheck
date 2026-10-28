@@ -7,9 +7,10 @@ recipient only. It does not send reports to an EMICOOL customer address.
 
 ## When it runs
 
-The **Generate EMICOOL OCI health report** workflow runs every day at 08:00 Cairo
-time (Africa/Cairo, DST-aware: 05:00 UTC in summer, 06:00 UTC in winter; GitHub
-may start scheduled runs a few minutes late) and can also be started from the **Actions** tab with **Run workflow**. Each run
+The **Generate EMICOOL OCI health report** workflow generates the report from 07:00
+Cairo time (Africa/Cairo, DST-aware) and holds the email until exactly 08:00
+Cairo. It can also be started from the **Actions** tab with **Run workflow**;
+manual runs only send the email when **send_email** is ticked. Each run
 uploads the generated files as an artifact named
 `emicool-oci-health-report-<run number>` and retains it for 30 days.
 

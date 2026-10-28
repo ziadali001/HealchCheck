@@ -2,13 +2,20 @@ name: Generate EMICOOL OCI health report
 
 on:
   workflow_dispatch:
+    inputs:
+      send_email:
+        description: "Email the report now (scheduled runs always email at 08:00 Cairo)"
+        type: boolean
+        default: false
   schedule:
-    # Target: 08:00 Africa/Cairo daily. GitHub cron is UTC-only and Cairo
+    # The report is generated from 07:00 Africa/Cairo and the email is held
+    # until exactly 08:00 Cairo, absorbing GitHub's scheduling delays and
+    # the report generation time. GitHub cron is UTC-only and Cairo
     # observes DST (UTC+3 in summer, UTC+2 in winter), so both candidate
     # times are scheduled and the cairo-window job keeps only the one that
     # matches today's offset. GitHub schedules run from the default branch.
-    - cron: "0 5 * * *" # 08:00 Cairo during summer time (UTC+3)
-    - cron: "0 6 * * *" # 08:00 Cairo during winter time (UTC+2)
+    - cron: "0 4 * * *" # 07:00 Cairo during summer time (UTC+3)
+    - cron: "0 5 * * *" # 07:00 Cairo during winter time (UTC+2)
 
 permissions:
   contents: read
@@ -19,7 +26,7 @@ concurrency:
 
 jobs:
   cairo-window:
-    name: Check 08:00 Cairo delivery window
+    name: Check Cairo schedule window
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.window.outputs.run }}
@@ -42,8 +49,8 @@ jobs:
           # so GitHub's queueing delays never cause a skipped day.
           cairo_offset="$(TZ=Africa/Cairo date +%z)"
           case "${cairo_offset}" in
-            +0300) expected_schedule="0 5 * * *" ;;
-            +0200) expected_schedule="0 6 * * *" ;;
+            +0300) expected_schedule="0 4 * * *" ;;
+            +0200) expected_schedule="0 5 * * *" ;;
             *)
               echo "::error::Unexpected Africa/Cairo offset ${cairo_offset}."
               exit 1
@@ -53,7 +60,7 @@ jobs:
           if [[ "${EVENT_SCHEDULE}" == "${expected_schedule}" ]]; then
             echo "run=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "Skipping: '${EVENT_SCHEDULE}' is not 08:00 Cairo today (offset ${cairo_offset})."
+            echo "Skipping: '${EVENT_SCHEDULE}' is not 07:00 Cairo today (offset ${cairo_offset})."
             echo "run=false" >> "${GITHUB_OUTPUT}"
           fi
 
@@ -62,7 +69,8 @@ jobs:
     needs: cairo-window
     if: needs.cairo-window.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Report generation plus up to an hour waiting for 08:00 Cairo.
+    timeout-minutes: 120
 
     steps:
       - name: Check out repository
@@ -136,8 +144,25 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Wait until 08:00 Cairo
+        if: success() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target_epoch="$(TZ=Africa/Cairo date -d 'today 08:00' +%s)"
+          now_epoch="$(date +%s)"
+          wait_seconds=$(( target_epoch - now_epoch ))
+
+          if (( wait_seconds > 0 )); then
+            echo "Holding the email for ${wait_seconds}s until 08:00 Cairo."
+            sleep "${wait_seconds}"
+          else
+            echo "::warning::Report finished after 08:00 Cairo; sending now."
+          fi
+
       - name: Email report to Ziad
-        if: success()
+        if: success() && (github.event_name == 'schedule' || inputs.send_email)
         env:
           REPORT_TEST_RECIPIENT: Ziad.Abdelrazek@zaintech.com
           REPORT_SENDER: ziad.cee@gmail.com
