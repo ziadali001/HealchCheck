@@ -1,18 +1,19 @@
 name: Generate EMICOOL OCI health report
 run-name: >-
   ${{ inputs.scheduled_delivery
-  && 'EMICOOL daily 08:00 delivery'
+  && 'EMICOOL daily 07:00 delivery'
   || 'Generate EMICOOL OCI health report' }}
 
 on:
   # Primary trigger: an external scheduler calls the workflow_dispatch API
-  # at 07:00 Africa/Cairo with scheduled_delivery=true (see README.md).
+  # at 07:00 Africa/Cairo with scheduled_delivery=true (see README.md); the
+  # report is emailed as soon as it has been generated.
   # Dispatched runs start within seconds, unlike GitHub's own cron, which
   # has been starting this workflow 4-6 hours late.
   workflow_dispatch:
     inputs:
       scheduled_delivery:
-        description: "Daily delivery: hold the email until 08:00 Cairo, then send"
+        description: "Daily 07:00 delivery: email the report once generated"
         type: boolean
         default: false
       send_email:
@@ -20,13 +21,13 @@ on:
         type: boolean
         default: false
   schedule:
-    # Backup only: sends the report if today's dispatched 08:00 delivery
-    # did not succeed. It is scheduled after 08:00 so it can never race
-    # the 07:00 trigger and send early, and off the top of the hour, when
-    # GitHub delays fewer scheduled runs. GitHub cron is UTC-only and Cairo
-    # observes DST (UTC+3 in summer, UTC+2 in winter), so both candidate
-    # times are scheduled and the cairo-window job keeps only the one that
-    # matches today's offset. GitHub schedules run from the default branch.
+    # Backup only: sends the report if today's dispatched 07:00 delivery
+    # did not succeed. It is scheduled well after 07:00 so it never races
+    # the daily delivery, and off the top of the hour, when GitHub delays
+    # fewer scheduled runs. GitHub cron is UTC-only and Cairo observes DST
+    # (UTC+3 in summer, UTC+2 in winter), so both candidate times are
+    # scheduled and the cairo-window job keeps only the one that matches
+    # today's offset. GitHub schedules run from the default branch.
     - cron: "17 6 * * *" # 09:17 Cairo during summer time (UTC+3)
     - cron: "17 7 * * *" # 09:17 Cairo during winter time (UTC+2)
 
@@ -76,7 +77,7 @@ jobs:
             exit 0
           fi
 
-          # Skip the backup when today's 08:00 delivery already succeeded
+          # Skip the backup when today's 07:00 delivery already succeeded
           # or is still running, so the report is never emailed twice.
           cairo_midnight="$(TZ=Africa/Cairo date -d 'today 00:00' +%s)"
           delivered_today="$(
@@ -87,17 +88,17 @@ jobs:
               --json displayTitle,status,conclusion,createdAt \
             | jq --argjson since "${cairo_midnight}" '[
                 .[]
-                | select(.displayTitle == "EMICOOL daily 08:00 delivery")
+                | select(.displayTitle == "EMICOOL daily 07:00 delivery")
                 | select((.createdAt | fromdateiso8601) >= $since)
                 | select(.status != "completed" or .conclusion == "success")
               ] | length'
           )"
 
           if (( delivered_today > 0 )); then
-            echo "Skipping backup: today's 08:00 delivery already ran."
+            echo "Skipping backup: today's 07:00 delivery already ran."
             echo "run=false" >> "${GITHUB_OUTPUT}"
           else
-            echo "::warning::No 08:00 delivery found today; sending backup report."
+            echo "::warning::No 07:00 delivery found today; sending backup report."
             echo "run=true" >> "${GITHUB_OUTPUT}"
           fi
 
@@ -106,10 +107,9 @@ jobs:
     needs: cairo-window
     if: needs.cairo-window.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # Report generation plus up to an hour waiting for 08:00 Cairo.
-    timeout-minutes: 120
+    timeout-minutes: 45
     # Job-level so the lightweight cairo-window checks are never queued
-    # (and cancelled while pending) behind a run waiting for 08:00.
+    # (and cancelled while pending) behind a running report.
     concurrency:
       group: emicool-oci-health-report
       cancel-in-progress: false
@@ -177,8 +177,6 @@ jobs:
             --config-file "${OCI_CONFIG_FILE}" \
             --output reports
 
-      # OCI access is no longer needed once the report exists, so the key
-      # is removed before the up-to-an-hour wait for 08:00 Cairo.
       - name: Remove OCI credentials from runner
         if: always()
         shell: bash
@@ -195,23 +193,6 @@ jobs:
           path: reports/
           if-no-files-found: warn
           retention-days: 30
-
-      - name: Wait until 08:00 Cairo
-        if: success() && inputs.scheduled_delivery
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          target_epoch="$(TZ=Africa/Cairo date -d 'today 08:00' +%s)"
-          now_epoch="$(date +%s)"
-          wait_seconds=$(( target_epoch - now_epoch ))
-
-          if (( wait_seconds > 0 )); then
-            echo "Holding the email for ${wait_seconds}s until 08:00 Cairo."
-            sleep "${wait_seconds}"
-          else
-            echo "::warning::Report finished after 08:00 Cairo; sending now. Start the external trigger earlier."
-          fi
 
       - name: Email report to Ziad
         if: >-

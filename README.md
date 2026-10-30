@@ -7,19 +7,19 @@ recipient only. It does not send reports to an EMICOOL customer address.
 
 ## When it runs
 
-The report is emailed every day at exactly **08:00 Cairo time**:
+The report runs every day at **07:00 Cairo time** and is emailed as soon as
+it has been generated:
 
 1. At 07:00 Africa/Cairo an external scheduler starts the workflow through
    the GitHub API with `scheduled_delivery=true`.
-2. The workflow generates the report, then holds the email until 08:00:00
-   Cairo and sends it.
-3. GitHub's own cron is kept only as a backup. It often starts hours late,
-   and it sends the report only if that day's 08:00 delivery did not
-   succeed, so the report is never emailed twice.
+2. The workflow generates the report and emails it immediately.
+3. GitHub's own cron (09:17 Cairo) is kept only as a backup. It often starts
+   hours late, and it sends the report only if that day's 07:00 delivery did
+   not succeed, so the report is never emailed twice.
 
-It can also be started from the **Actions** tab with **Run workflow**: tick
-**send_email** to email the report immediately, or **scheduled_delivery** to
-hold it until 08:00. Each run uploads the generated files as an artifact named
+It can also be started from the **Actions** tab with **Run workflow**; tick
+**send_email** or **scheduled_delivery** to email the report. Each run
+uploads the generated files as an artifact named
 `emicool-oci-health-report-<run number>` and retains it for 30 days.
 
 ### Setting up the 07:00 trigger (cron-job.org)
@@ -40,7 +40,7 @@ hold it until 08:00. Each run uploads the generated files as an artifact named
    - **Advanced > Request body:**
      `{"ref":"main","inputs":{"scheduled_delivery":"true"}}`
 3. Use **Test run**: GitHub answers `204 No Content`, and a run named
-   **EMICOOL daily 08:00 delivery** appears in the **Actions** tab.
+   **EMICOOL daily 07:00 delivery** appears in the **Actions** tab.
 
 Any other scheduler that can send this POST request at 07:00 Cairo (Azure
 Logic Apps, Power Automate, a server cron job) works the same way.
