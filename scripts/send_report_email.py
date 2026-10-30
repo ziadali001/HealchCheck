@@ -114,8 +114,13 @@ def report_date(data):
 
 def format_cost(summary):
     total = summary.get("cost_total")
-    if not isinstance(total, (int, float)):
-        return "N/A"
+    # A failed Usage API call leaves cost_total at 0; don't report that
+    # as a real zero spend.
+    if (
+        not isinstance(total, (int, float))
+        or str(summary.get("cost_status", "")).upper() != "COLLECTED"
+    ):
+        return "Not available"
     currency = summary.get("cost_currency", "USD")
     days = summary.get("cost_period_days")
     period = f" ({days} days)" if days else ""
