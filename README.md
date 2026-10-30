@@ -7,15 +7,14 @@ recipient only. It does not send reports to an EMICOOL customer address.
 
 ## When it runs
 
-The report runs every day at **07:00 Cairo time** and is emailed as soon as
-it has been generated:
+The report runs every day at **07:00 Cairo time** (Africa/Cairo, DST-aware)
+and is emailed as soon as it has been generated.
 
-1. At 07:00 Africa/Cairo an external scheduler starts the workflow through
-   the GitHub API with `scheduled_delivery=true`.
-2. The workflow generates the report and emails it immediately.
-3. GitHub's own cron (09:17 Cairo) is kept only as a backup. It often starts
-   hours late, and it sends the report only if that day's 07:00 delivery did
-   not succeed, so the report is never emailed twice.
+GitHub does not guarantee the start time of scheduled runs and has started
+this workflow several hours late. For an on-time 07:00 start, also set up the
+external trigger below: it starts the workflow through the GitHub API with
+`scheduled_delivery=true`, and the GitHub schedule then skips that day so the
+report is never emailed twice.
 
 It can also be started from the **Actions** tab with **Run workflow**; tick
 **send_email** or **scheduled_delivery** to email the report. Each run
