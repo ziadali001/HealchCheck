@@ -41,6 +41,7 @@ import base64
 import concurrent.futures
 import datetime
 import io
+import ipaddress
 import json
 import os
 import re
@@ -48,6 +49,7 @@ import sys
 import threading
 import traceback
 import warnings
+from collections import Counter
 
 # The 'strict' parameter FutureWarning comes from urllib3 being called
 # internally by the OCI SDK's HTTP layer; it's not something this script
@@ -103,6 +105,66 @@ IDLE_CPU_PEAK_PERCENT = 20
 COST_INCREASE_WARN_PERCENT = 10
 COST_INCREASE_HIGH_PERCENT = 25
 COST_DAILY_SPIKE_FACTOR = 1.5
+
+# Additional recommendation thresholds.
+MEMORY_WARN_PERCENT = 75
+CPU_PEAK_WARN_PERCENT = 90
+MEMORY_OVERSIZED_PEAK_PERCENT = 30
+MEMORY_OVERSIZED_MIN_GB = 8
+PREMIUM_SHAPE_LOW_CPU_PERCENT = 25
+NONPROD_RUNNING_HOURS_PER_WEEK = 60
+BACKUP_COST_SHARE_WARN_PERCENT = 30
+LARGE_BUCKET_GB = 100
+ADMIN_GROUP_NAME = "Administrators"
+ADMIN_GROUP_WARN_COUNT = 5
+SHARED_MAILBOX_MIN_ACCOUNTS = 3
+ALARM_SEVERITY_REVIEW_MIN = 10
+ALARM_CRITICAL_SHARE_WARN = 0.8
+OS_END_OF_SUPPORT_WARN_DAYS = 365
+OS_END_OF_SUPPORT_URGENT_DAYS = 90
+UNMATCHED_BILLED_PREFIXES = (
+    "ocid1.instance.", "ocid1.volume.", "ocid1.bootvolume."
+)
+
+RECOMMENDATION_TIMEFRAMES = {
+    "high": "This week",
+    "medium": "Within 30 days",
+    "low": "This quarter"
+}
+
+# Vendor end-of-support dates, matched against the start of the
+# instance's lower-cased OS name. For Windows this is the end of
+# extended support; for Oracle Linux, the end of Premier Support.
+OS_END_OF_SUPPORT = [
+    ("windows server 2012", "Windows Server 2012", "2023-10-10"),
+    ("windows server 2016", "Windows Server 2016", "2027-01-12"),
+    ("windows server 2019", "Windows Server 2019", "2029-01-09"),
+    ("oracle linux 6", "Oracle Linux 6", "2021-03-31"),
+    ("oracle linux 7", "Oracle Linux 7", "2024-12-31"),
+    ("centos 7", "CentOS 7", "2024-06-30"),
+    ("centos 8", "CentOS 8", "2021-12-31"),
+    ("ubuntu 18.04", "Ubuntu 18.04", "2023-05-31"),
+    ("ubuntu 20.04", "Ubuntu 20.04", "2025-05-31"),
+]
+
+# Environment detection from OCI names, which mix separators and
+# CamelCase: "PATCH_TEST_2", "EMC-OCI-Web-UATCXApp01", "EMMSYSTest".
+# Lower-case runs are only matched as whole words, so that names like
+# "AD-latest" and "Device" are not mistaken for test or dev.
+NON_PROD_WORD_PATTERN = re.compile(
+    r"(?:^|[^A-Za-z0-9])"
+    r"(dev|development|test|testing|uat|sit|qa|stg|staging|sandbox|poc"
+    r"|demo|nonprod)"
+    r"(?:$|[^A-Za-z0-9])",
+    re.IGNORECASE
+)
+NON_PROD_CAMEL_PATTERN = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:Dev|Test|UAT|SIT|QA)(?=[A-Z])"
+    r"|(?<=[A-Za-z0-9])(?:Dev|Test|UAT)(?=$|[^a-z])"
+)
+PROD_COMPARTMENT_PATTERN = re.compile(
+    r"(?:^|[^A-Za-z0-9])[Pp]rod(?:$|[^A-Za-z0-9])|(?<=[a-z])Prod(?:$|[^a-z])"
+)
 
 # Resource types that are recurring, automatically generated artifacts of
 # infrastructure that already exists (e.g. daily policy-based backups).
@@ -230,6 +292,38 @@ def classify_os_family(os_info):
     return "Other / Custom"
 
 
+def is_non_production(resource):
+    """True if a resource's name or compartment marks it dev/test/UAT."""
+    for value in (resource.get("name"), resource.get("compartment")):
+        text = str(value or "")
+        if (
+            NON_PROD_WORD_PATTERN.search(text)
+            or NON_PROD_CAMEL_PATTERN.search(text)
+        ):
+            return True
+    return False
+
+
+def resolve_plurals(text):
+    """Turn "1 instance(s)" into "1 instance", using the first number."""
+    match = re.search(r"\d[\d,]*", text)
+    singular = match is not None and match.group(0) == "1"
+    return (
+        text
+        .replace("(es)", "" if singular else "es")
+        .replace("(s)", "" if singular else "s")
+    )
+
+
+def backup_stored_gb(backup):
+    """
+    GB a backup actually occupies. `size_gb` is the size of the source
+    volume, so summing it across incremental backups greatly overstates
+    what is stored; OCI reports the real usage as unique_size_in_gbs.
+    """
+    return backup.get("unique_size_gb") or backup.get("size_gb") or 0
+
+
 def get_name(obj):
     """
     Try common OCI name attributes.
@@ -307,6 +401,7 @@ class OCIHealthCheck:
         self.resource_costs = {}
         self.state_lock = threading.Lock()
         self.policy_cache = {}
+        self.volume_attachments = {}
         self.image_os_cache = {}
         self.instance_name_cache = {}
         self.ad_cache = {}
@@ -798,7 +893,18 @@ class OCIHealthCheck:
             self.data["cloud_guard"] = {
                 "status": status,
                 "targets": len(targets),
-                "problems": len(problems)
+                "problems": len(problems),
+                "by_risk": dict(Counter(
+                    str(safe(getattr(problem, "risk_level", None), "UNKNOWN"))
+                    for problem in problems
+                )),
+                "top_rules": Counter(
+                    str(safe(
+                        getattr(problem, "detector_rule_id", None),
+                        "UNKNOWN"
+                    ))
+                    for problem in problems
+                ).most_common(10)
             }
 
             return self.data["cloud_guard"]
@@ -948,6 +1054,9 @@ class OCIHealthCheck:
                                 None
                             )
                         ),
+                    "fault_domain": safe(
+                        getattr(instance, "fault_domain", None), None
+                    ),
                     "time_created":
                         iso(
                             getattr(
@@ -1097,6 +1206,11 @@ class OCIHealthCheck:
                         "UNKNOWN"
                     ).upper()
                 }
+
+                with self.state_lock:
+                    self.volume_attachments[attachment.volume_id] = (
+                        attachments[attachment.volume_id]
+                    )
         except Exception:
             pass
 
@@ -1129,10 +1243,51 @@ class OCIHealthCheck:
                     attachments[attachment.boot_volume_id] = (
                         attachment.instance_id
                     )
+
+                    with self.state_lock:
+                        self.volume_attachments[
+                            attachment.boot_volume_id
+                        ] = {
+                            "instance_id": attachment.instance_id,
+                            "attachment_type": "PARAVIRTUALIZED"
+                        }
             except Exception:
                 pass
 
         return attachments
+
+
+    def reconcile_volume_attachments(self, compute_client, resources):
+        """
+        Correct volumes wrongly marked detached.
+
+        An attachment belongs to the instance's compartment, so a volume
+        kept in a different compartment from its instance is not found
+        when attachments are listed compartment by compartment. Once
+        every compartment in the region has been read, the attachment
+        is known and can be applied.
+        """
+
+        for resource in resources:
+
+            if (
+                resource.get("resource_type")
+                not in ("Block Volume", "Boot Volume")
+                or resource.get("attachment_status") != "DETACHED"
+            ):
+                continue
+
+            attachment = self.volume_attachments.get(resource.get("id"))
+
+            if not attachment:
+                continue
+
+            resource["attachment_status"] = "ATTACHED"
+            resource["attachment_type"] = attachment["attachment_type"]
+            resource["attached_instance"] = self.get_instance_name_cached(
+                compute_client,
+                attachment["instance_id"]
+            )
 
 
     def collect_storage(
@@ -1831,6 +1986,9 @@ class OCIHealthCheck:
                     "size_gb": safe(
                         getattr(backup, "size_in_gbs", None), 0
                     ) or 0,
+                    "unique_size_gb": safe(
+                        getattr(backup, "unique_size_in_gbs", None), 0
+                    ) or 0,
                     "time_created": iso(created),
                     "age_days":
                         round(age_days, 2)
@@ -1887,6 +2045,9 @@ class OCIHealthCheck:
                     "state": lifecycle(backup),
                     "size_gb": safe(
                         getattr(backup, "size_in_gbs", None), 0
+                    ) or 0,
+                    "unique_size_gb": safe(
+                        getattr(backup, "unique_size_in_gbs", None), 0
                     ) or 0,
                     "time_created": iso(created),
                     "age_days":
@@ -3372,7 +3533,8 @@ class OCIHealthCheck:
         already collected in this run. Every item is backed by concrete
         findings (counts, names, amounts); savings figures are estimates
         based on this tenancy's own billed amounts for the period, never
-        list prices.
+        list prices, and no resource is counted towards two savings
+        figures.
         """
 
         data = self.data
@@ -3383,36 +3545,62 @@ class OCIHealthCheck:
         period = self.cost_analysis_days
         recommendations = []
 
+        default_section = {
+            "Cost": "billing",
+            "Security": "iam-security",
+            "Reliability": "volume-policies",
+            "Performance": "compute-instances",
+            "Operations": "alarms",
+            "Governance": "compartments"
+        }
+
         def add(severity, category, title, detail, action,
-                items=None, savings=None):
-            names = [str(x) for x in (items or []) if x]
+                items=None, savings=None, effort="Medium", section=None):
+            names = [str(x).strip() for x in (items or []) if x]
             recommendations.append({
                 "severity": severity,
                 "category": category,
-                "title": title,
+                "title": resolve_plurals(title),
                 "detail": detail,
                 "action": action,
                 "affected_count": len(items or []),
                 "affected": names[:10],
+                "affected_all": names,
                 "estimated_savings": (
                     round(savings, 2) if savings else None
                 ),
-                "currency": currency
+                "currency": currency,
+                "timeframe": RECOMMENDATION_TIMEFRAMES[severity],
+                "effort": effort,
+                "section": section or default_section[category]
             })
 
         def money(amount):
             return f"{currency} {amount:,.2f}"
 
-        def of_type(resource_type):
+        def of_type(*resource_types):
             return [
                 r for r in resources
-                if r.get("resource_type") == resource_type
+                if r.get("resource_type") in resource_types
             ]
 
+        def billed(items):
+            return sum(
+                self.resource_costs.get(r.get("id"), 0) for r in items
+            )
+
+        def stored_gb(backup):
+            return backup_stored_gb(backup)
+
         instances = of_type("Compute Instance")
+        running = [r for r in instances if r.get("state") == "RUNNING"]
+        volumes = of_type("Block Volume", "Boot Volume")
+        backups = of_type("Block Volume Backup", "Boot Volume Backup")
+        buckets = of_type("Object Storage Bucket")
         utilization_by_id = {
             u["instance_id"]: u for u in data.get("utilization", [])
         }
+        name_by_id = {r.get("id"): r.get("name") for r in instances}
 
         # ----------------------------------------------------
         # COST
@@ -3453,7 +3641,8 @@ class OCIHealthCheck:
                     "Review resources created or resized in these "
                     "services during the period and confirm the "
                     "increase is expected.",
-                    items=[service for service, _ in movers]
+                    items=[service for service, _ in movers],
+                    effort="Low"
                 )
 
             daily = cost.get("daily", [])
@@ -3476,23 +3665,97 @@ class OCIHealthCheck:
                     ) + ".",
                     "Open Cost Analysis for those dates, grouped by "
                     "service and resource, to find the one-off charge.",
-                    items=[p["date"] for p in spikes]
+                    items=[p["date"] for p in spikes],
+                    effort="Low"
                 )
 
-        # Detached block volumes keep billing for storage + VPUs.
-        detached = [
-            r for r in of_type("Block Volume")
-            if r.get("attachment_status") == "DETACHED"
-        ]
-        if detached:
-            detached_gb = sum(r.get("size_gb") or 0 for r in detached)
-            savings = sum(
-                self.resource_costs.get(r["id"], 0) for r in detached
+            # How much of Block Storage is the live volumes, and how
+            # much is everything else (backups, deleted volumes).
+            block_cost = cost.get("by_service_current", {}).get(
+                "Block Storage", 0
             )
+            volume_cost = billed(volumes)
+            other_share = (
+                (block_cost - volume_cost) / block_cost * 100
+                if block_cost and volume_cost else 0
+            )
+            if other_share >= BACKUP_COST_SHARE_WARN_PERCENT and backups:
+                total_tb = sum(stored_gb(b) for b in backups) / 1024
+                add(
+                    "medium",
+                    "Cost",
+                    f"About {other_share:.0f}% of Block Storage spend is "
+                    f"not on live volumes",
+                    f"Block Storage cost {money(block_cost)} in the last "
+                    f"{period} days, of which live volumes account for "
+                    f"{money(volume_cost)}. The remaining "
+                    f"{money(block_cost - volume_cost)} is mainly volume "
+                    f"backups: {len(backups):,} backups holding about "
+                    f"{total_tb:,.1f} TB, an average of "
+                    f"{len(backups) / max(len(volumes), 1):,.0f} per "
+                    f"volume.",
+                    "Compare the daily, weekly, monthly and yearly "
+                    "retention in each backup policy with the agreed "
+                    "retention requirement, then shorten what exceeds "
+                    "it. Backups created by a policy expire on that "
+                    "policy's new schedule.",
+                    effort="Medium",
+                    section="volume-policies"
+                )
+
+            # Instances and volumes that are billed but were not found
+            # by the inventory scan.
+            inventory_ids = {r.get("id") for r in resources}
+            unmatched = sorted(
+                (
+                    (resource_id, amount)
+                    for resource_id, amount in self.resource_costs.items()
+                    if resource_id.startswith(UNMATCHED_BILLED_PREFIXES)
+                    and resource_id not in inventory_ids
+                    and amount >= 1
+                ),
+                key=lambda pair: pair[1],
+                reverse=True
+            )
+            if unmatched and not self.region_filter:
+                add(
+                    "medium",
+                    "Cost",
+                    f"{len(unmatched)} billed instance(s) or volume(s) "
+                    f"not found in the inventory",
+                    f"OCI billed {money(sum(a for _, a in unmatched))} "
+                    f"in the last {period} days for compute or storage "
+                    "resources that this scan did not find. They were "
+                    "either deleted during the period or sit somewhere "
+                    "the reporting user cannot read.",
+                    "Look up each OCID in Cost Analysis. If the resource "
+                    "still exists, grant the reporting user read access "
+                    "to its compartment. If it was deleted, confirm the "
+                    "charge has stopped.",
+                    items=[
+                        f"{short_ocid(resource_id)} ({money(amount)})"
+                        for resource_id, amount in unmatched
+                    ],
+                    effort="Low"
+                )
+
+        # Detached volumes keep billing for storage + VPUs.
+        for volume_type, section_label in (
+            ("Block Volume", "block volume"),
+            ("Boot Volume", "boot volume")
+        ):
+            detached = [
+                r for r in of_type(volume_type)
+                if r.get("attachment_status") == "DETACHED"
+            ]
+            if not detached:
+                continue
+            detached_gb = sum(r.get("size_gb") or 0 for r in detached)
+            savings = billed(detached)
             add(
                 "medium",
                 "Cost",
-                f"{len(detached)} detached block volume(s) "
+                f"{len(detached)} detached {section_label}(s) "
                 f"({detached_gb:,.0f} GB)",
                 "These volumes are not attached to any instance but are "
                 "still billed for storage and performance units."
@@ -3504,7 +3767,9 @@ class OCIHealthCheck:
                 "Confirm with the owners, take a final backup if "
                 "needed, then delete them.",
                 items=[r.get("name") for r in detached],
-                savings=savings
+                savings=savings,
+                effort="Low",
+                section="volume-policies"
             )
 
         # Stopped instances: compute is free, attached storage isn't.
@@ -3519,15 +3784,50 @@ class OCIHealthCheck:
                 "their boot and block volumes are still billed.",
                 "Terminate instances that are no longer needed (keep a "
                 "boot volume backup if required).",
-                items=[r.get("name") for r in stopped]
+                items=[r.get("name") for r in stopped],
+                effort="Low",
+                section="compute-instances"
             )
 
-        # Idle running instances -> rightsize or schedule.
+        # Non-production compute that runs around the clock.
+        nonprod_running = [r for r in running if is_non_production(r)]
+        nonprod_ids = {r.get("id") for r in nonprod_running}
+        if nonprod_running:
+            nonprod_cost = billed(nonprod_running)
+            off_share = 1 - NONPROD_RUNNING_HOURS_PER_WEEK / (24 * 7)
+            add(
+                "medium",
+                "Cost",
+                f"{len(nonprod_running)} non-production instance(s) "
+                f"running around the clock",
+                "Development, test and UAT instances were running for "
+                "the whole period."
+                + (
+                    f" They cost {money(nonprod_cost)} in compute over "
+                    f"the last {period} days."
+                    if nonprod_cost else ""
+                )
+                + f" Running them {NONPROD_RUNNING_HOURS_PER_WEEK} hours "
+                f"a week (12 hours on 5 days) would remove about "
+                f"{off_share * 100:.0f}% of that cost.",
+                "Stop these instances outside working hours with OCI "
+                "Resource Scheduler, after confirming no overnight jobs "
+                "depend on them. Boot and block volumes keep billing "
+                "while an instance is stopped.",
+                items=[r.get("name") for r in nonprod_running],
+                savings=nonprod_cost * off_share if nonprod_cost else None,
+                effort="Low",
+                section="compute-instances"
+            )
+
+        # Idle always-on instances -> rightsize. Non-production ones are
+        # already covered by the schedule above, so their savings are
+        # not counted twice.
         idle = []
-        for r in instances:
+        for r in running:
             u = utilization_by_id.get(r.get("id"))
             if (
-                r.get("state") == "RUNNING"
+                r.get("id") not in nonprod_ids
                 and u
                 and u.get("cpu") is not None
                 and u["cpu"] < IDLE_CPU_AVG_PERCENT
@@ -3535,13 +3835,11 @@ class OCIHealthCheck:
             ):
                 idle.append(r)
         if idle:
-            idle_cost = sum(
-                self.resource_costs.get(r["id"], 0) for r in idle
-            )
+            idle_cost = billed(idle)
             add(
                 "medium",
                 "Cost",
-                f"{len(idle)} running instance(s) were idle all period",
+                f"{len(idle)} production instance(s) idle all period",
                 f"Average CPU below {IDLE_CPU_AVG_PERCENT}% and never "
                 f"above {IDLE_CPU_PEAK_PERCENT}% (hourly) over the last "
                 f"{self.utilization_days} days."
@@ -3549,24 +3847,110 @@ class OCIHealthCheck:
                     f" Their compute cost for the period was "
                     f"{money(idle_cost)}."
                     if idle_cost else ""
-                ),
-                "Rightsize to fewer OCPUs (Flex shapes), stop them "
-                "outside business hours, or decommission them.",
+                )
+                + " The estimate assumes halving their OCPUs.",
+                "Rightsize to fewer OCPUs (Flex shapes) or decommission "
+                "them. Check month-end and batch peaks first, and keep "
+                "enough capacity for one node of a pair to carry the "
+                "load alone.",
                 items=[r.get("name") for r in idle],
                 # Halving OCPUs is a conservative rightsizing estimate.
-                savings=idle_cost / 2 if idle_cost else None
+                savings=idle_cost / 2 if idle_cost else None,
+                effort="Medium",
+                section="compute-instances"
+            )
+
+        # Flex shapes bill memory separately from OCPUs.
+        memory_oversized = []
+        for r in running:
+            u = utilization_by_id.get(r.get("id"))
+            if (
+                "Flex" in str(r.get("shape"))
+                and u
+                and u.get("memory_peak") is not None
+                and u["memory_peak"] < MEMORY_OVERSIZED_PEAK_PERCENT
+                and (r.get("memory_gb") or 0) >= MEMORY_OVERSIZED_MIN_GB
+            ):
+                memory_oversized.append(r)
+        if memory_oversized:
+            add(
+                "low",
+                "Cost",
+                f"{len(memory_oversized)} Flex instance(s) with "
+                f"oversized memory",
+                f"Memory never exceeded "
+                f"{MEMORY_OVERSIZED_PEAK_PERCENT}% (hourly) over the last "
+                f"{self.utilization_days} days on instances holding "
+                f"{sum(r.get('memory_gb') or 0 for r in memory_oversized):,.0f}"
+                " GB in total. Flex shapes bill memory separately from "
+                "OCPUs.",
+                "Lower the memory allocation on the next maintenance "
+                "window. Changing a Flex shape's memory restarts the "
+                "instance.",
+                items=[r.get("name") for r in memory_oversized],
+                effort="Low",
+                section="compute-instances"
+            )
+
+        # Premium shapes running very light workloads.
+        premium_idle = []
+        for r in running:
+            u = utilization_by_id.get(r.get("id"))
+            if (
+                "Optimized" in str(r.get("shape"))
+                and u
+                and u.get("cpu") is not None
+                and u["cpu"] < PREMIUM_SHAPE_LOW_CPU_PERCENT
+            ):
+                premium_idle.append(r)
+        if premium_idle:
+            add(
+                "low",
+                "Cost",
+                f"{len(premium_idle)} high-frequency Optimized "
+                f"instance(s) under light load",
+                "Optimized shapes carry a higher per-OCPU price for "
+                f"high-frequency compute, but these averaged below "
+                f"{PREMIUM_SHAPE_LOW_CPU_PERCENT}% CPU over the last "
+                f"{self.utilization_days} days.",
+                "Test the workload on a Standard Flex shape. Keep the "
+                "Optimized shape only if application response times "
+                "depend on it.",
+                items=[r.get("name") for r in premium_idle],
+                effort="Medium",
+                section="compute-instances"
+            )
+
+        # Autonomous Databases outside production.
+        nonprod_adb = [
+            r for r in of_type("Autonomous Database")
+            if r.get("state") == "AVAILABLE" and is_non_production(r)
+        ]
+        if nonprod_adb:
+            adb_cost = billed(nonprod_adb)
+            add(
+                "low",
+                "Cost",
+                f"{len(nonprod_adb)} non-production Autonomous "
+                f"Database(s) running around the clock",
+                "These databases are always available."
+                + (
+                    f" They cost {money(adb_cost)} in the last "
+                    f"{period} days."
+                    if adb_cost else ""
+                ),
+                "Set an auto-stop schedule so compute is only billed "
+                "during working hours. Storage continues to bill while "
+                "the database is stopped.",
+                items=[r.get("name") for r in nonprod_adb],
+                effort="Low",
+                section="database"
             )
 
         # Orphaned backups: the source volume no longer exists. Skipped
         # for single-region scans, where the source volume may simply be
         # in a region that wasn't scanned.
-        volume_ids = {
-            r.get("id") for r in resources
-            if r.get("resource_type") in ("Block Volume", "Boot Volume")
-        }
-        backups = (
-            of_type("Block Volume Backup") + of_type("Boot Volume Backup")
-        )
+        volume_ids = {r.get("id") for r in volumes}
         orphaned = [
             b for b in backups
             if b.get("source_volume_id")
@@ -3578,11 +3962,13 @@ class OCIHealthCheck:
                 "Cost",
                 f"{len(orphaned)} backup(s) of volumes that no longer "
                 f"exist",
-                f"{sum(b.get('size_gb') or 0 for b in orphaned):,.0f} GB "
+                f"{sum(stored_gb(b) for b in orphaned):,.0f} GB "
                 "of backups belong to deleted volumes.",
                 "Keep only the backups required for retention or "
                 "compliance and delete the rest.",
-                items=[b.get("name") for b in orphaned]
+                items=[b.get("name") for b in orphaned],
+                effort="Low",
+                section="volume-policies"
             )
 
         old_backups = [
@@ -3593,12 +3979,88 @@ class OCIHealthCheck:
                 "low",
                 "Cost",
                 f"{len(old_backups)} backup(s) older than one year",
-                f"{sum(b.get('size_gb') or 0 for b in old_backups):,.0f} "
+                f"{sum(stored_gb(b) for b in old_backups):,.0f} "
                 "GB of backup storage is more than 365 days old.",
                 "Check the backup policy retention (e.g. yearly "
                 "backups in the Gold policy) against the actual "
                 "retention requirement.",
-                items=[b.get("name") for b in old_backups]
+                items=[b.get("name") for b in old_backups],
+                effort="Low",
+                section="volume-policies"
+            )
+
+        # Test data held under the production retention.
+        prod_policies = {
+            r.get("backup_policy_name") for r in volumes
+            if r.get("backup_policy_name") and not is_non_production(r)
+        }
+        nonprod_on_prod_policy = [
+            r for r in volumes
+            if is_non_production(r)
+            and r.get("backup_policy_name") in prod_policies
+        ]
+        if nonprod_on_prod_policy:
+            add(
+                "low",
+                "Cost",
+                f"{len(nonprod_on_prod_policy)} non-production volume(s) "
+                f"on the production backup policy",
+                "These volumes keep the same backup schedule and "
+                "retention as production data, although they rarely "
+                "need it.",
+                "Create a shorter-retention policy for development and "
+                "test volumes and assign it to these.",
+                items=[r.get("name") for r in nonprod_on_prod_policy],
+                effort="Low",
+                section="volume-policies"
+            )
+
+        # Object Storage housekeeping.
+        large_standard = [
+            r for r in buckets
+            if (r.get("size_gb") or 0) >= LARGE_BUCKET_GB
+            and r.get("storage_tier") == "Standard"
+            and not re.search(r"veeam", str(r.get("name")), re.I)
+        ]
+        if large_standard:
+            add(
+                "low",
+                "Cost",
+                f"{len(large_standard)} large bucket(s) on the Standard "
+                f"tier",
+                f"{sum(r.get('size_gb') or 0 for r in large_standard):,.0f}"
+                " GB is stored on the Standard tier in these buckets.",
+                "Add an Object Lifecycle policy that moves objects "
+                "unread for 30 days to Infrequent Access or Archive, and "
+                "deletes test data that is no longer needed.",
+                items=[r.get("name") for r in large_standard],
+                effort="Low",
+                section="object-storage"
+            )
+
+        cutoff = (
+            self.report_time - datetime.timedelta(days=30)
+        ).isoformat()
+        empty_buckets = [
+            r for r in buckets
+            if not r.get("object_count")
+            and not r.get("size_gb")
+            and r.get("time_created")
+            and r["time_created"] < cutoff
+        ]
+        if empty_buckets:
+            add(
+                "low",
+                "Governance",
+                f"{len(empty_buckets)} empty bucket(s) older than 30 "
+                f"days",
+                "These buckets hold no objects and add to the access "
+                "review without providing any value.",
+                "Delete the ones with no planned use, or record why "
+                "they are being kept.",
+                items=[r.get("name") for r in empty_buckets],
+                effort="Low",
+                section="object-storage"
             )
 
         # ----------------------------------------------------
@@ -3615,39 +4077,204 @@ class OCIHealthCheck:
                 f"'{cloud_guard.get('status')}', so misconfigurations "
                 "and suspicious activity are not being detected.",
                 "Enable Cloud Guard in the home region with the "
-                "Oracle-managed detector and responder recipes."
+                "Oracle-managed detector and responder recipes.",
+                effort="Low"
             )
         elif cloud_guard.get("problems"):
+            by_risk = cloud_guard.get("by_risk") or {}
+            risk_text = ", ".join(
+                f"{by_risk[level]} {level.lower()}"
+                for level in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "MINOR")
+                if by_risk.get(level)
+            )
             add(
                 "high" if cloud_guard["problems"] >= 50 else "medium",
                 "Security",
                 f"{cloud_guard['problems']} open Cloud Guard problem(s)",
                 "Cloud Guard has open findings that have not been "
-                "resolved or dismissed.",
-                "Triage the problems by risk level; remediate or "
-                "dismiss with a documented reason."
+                "resolved or dismissed."
+                + (f" Risk levels: {risk_text}." if risk_text else ""),
+                "Triage the problems by risk level, starting with "
+                "critical and high; remediate or dismiss with a "
+                "documented reason. Assign an owner so the backlog "
+                "stays under control.",
+                items=[
+                    f"{rule} ({count})"
+                    for rule, count in cloud_guard.get("top_rules", [])
+                ],
+                effort="High"
             )
 
-        no_mfa = [
-            u for u in data.get("iam", {}).get("users", [])
-            if u.get("mfa") is False
-            and str(u.get("state", "")).upper() == "ACTIVE"
+        iam_users = data.get("iam", {}).get("users", [])
+        active_users = [
+            u for u in iam_users
+            if str(u.get("state", "")).upper() == "ACTIVE"
         ]
+        no_mfa = [u for u in active_users if u.get("mfa") is False]
+
+        admins = [
+            u for u in active_users
+            if ADMIN_GROUP_NAME in (u.get("groups") or [])
+        ]
+        admins_no_mfa = [u for u in admins if u.get("mfa") is False]
+        if admins_no_mfa:
+            add(
+                "high",
+                "Security",
+                f"{len(admins_no_mfa)} tenancy administrator(s) without "
+                f"MFA",
+                "Members of the Administrators group have full control "
+                "of the tenancy, so one stolen password exposes every "
+                "resource.",
+                "Turn on MFA for these accounts first, today if "
+                "possible, and require it for the Administrators group "
+                "in the identity domain sign-on policy.",
+                items=[u.get("name") for u in admins_no_mfa],
+                effort="Low"
+            )
+
         if no_mfa:
+            coverage = (
+                (len(active_users) - len(no_mfa))
+                / len(active_users) * 100
+            )
             add(
                 "high",
                 "Security",
                 f"{len(no_mfa)} active IAM user(s) without MFA",
+                f"MFA coverage is {coverage:.0f}% of active users. "
                 "Users without multi-factor authentication are the most "
                 "common route to account compromise.",
                 "Enforce MFA for all console users (sign-on policy in "
                 "the identity domain); use API keys only for service "
                 "users.",
-                items=[u.get("name") for u in no_mfa]
+                items=[u.get("name") for u in no_mfa],
+                effort="Medium"
+            )
+
+        if len(admins) > ADMIN_GROUP_WARN_COUNT:
+            add(
+                "medium",
+                "Security",
+                f"{len(admins)} active members of the Administrators "
+                f"group",
+                "Tenancy-wide administrator rights should be limited to "
+                "a small number of named people. Every extra member "
+                "widens the impact of a compromised account.",
+                "Move day-to-day work to compartment-scoped admin "
+                "groups and keep the Administrators group for "
+                "break-glass use.",
+                items=[u.get("name") for u in admins],
+                effort="Medium"
+            )
+
+        # Accounts outside the customer's own email domain.
+        def email_domain(user):
+            email = str(user.get("email") or user.get("name") or "")
+            return email.rsplit("@", 1)[1].lower() if "@" in email else ""
+
+        domain_counts = Counter(
+            email_domain(u) for u in active_users if email_domain(u)
+        )
+        if domain_counts:
+            home_domain = domain_counts.most_common(1)[0][0]
+            external = {
+                domain: count
+                for domain, count in domain_counts.items()
+                if domain != home_domain
+            }
+            if external:
+                vendor_text = ", ".join(
+                    f"{domain} ({count})"
+                    for domain, count in sorted(
+                        external.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True
+                    )
+                )
+                add(
+                    "medium",
+                    "Security",
+                    f"{sum(external.values())} active account(s) from "
+                    f"{len(external)} external domain(s)",
+                    f"Active users outside {home_domain}, the most "
+                    f"common domain in this tenancy: {vendor_text}.",
+                    "Review these accounts with each vendor contact on "
+                    "a quarterly basis and deactivate anyone who has "
+                    "left the project.",
+                    items=[
+                        u.get("name") for u in active_users
+                        if email_domain(u) in external
+                    ],
+                    effort="Medium"
+                )
+
+        inactive_with_groups = [
+            u for u in iam_users
+            if str(u.get("state", "")).upper() == "INACTIVE"
+            and u.get("groups")
+        ]
+        if inactive_with_groups:
+            add(
+                "low",
+                "Security",
+                f"{len(inactive_with_groups)} inactive user(s) still in "
+                f"IAM groups",
+                "If one of these accounts is reactivated, it regains "
+                "all of its previous access at once.",
+                "Remove inactive users from their groups, or delete "
+                "accounts that are no longer needed.",
+                items=[u.get("name") for u in inactive_with_groups],
+                effort="Low"
+            )
+
+        no_group = [u for u in active_users if not u.get("groups")]
+        if no_group:
+            add(
+                "low",
+                "Security",
+                f"{len(no_group)} active user(s) with no IAM group",
+                "These accounts can sign in but get no access through "
+                "a group, so they are likely unused or left over from "
+                "earlier projects.",
+                "Confirm whether each account is still needed, then "
+                "assign a group or deactivate it.",
+                items=[u.get("name") for u in no_group],
+                effort="Low"
+            )
+
+        email_counts = Counter(
+            str(u.get("email")).lower()
+            for u in active_users if u.get("email")
+        )
+        shared_mailboxes = {
+            email: count for email, count in email_counts.items()
+            if count >= SHARED_MAILBOX_MIN_ACCOUNTS
+        }
+        if shared_mailboxes:
+            shared_users = [
+                u for u in active_users
+                if str(u.get("email")).lower() in shared_mailboxes
+            ]
+            add(
+                "low",
+                "Security",
+                f"{len(shared_users)} active accounts share "
+                f"{len(shared_mailboxes)} mailbox(es)",
+                "Password resets and security notices for these "
+                "accounts all go to the same address, so it is hard to "
+                "tell who owns each one: " + ", ".join(
+                    f"{email} ({count})"
+                    for email, count in shared_mailboxes.items()
+                ) + ".",
+                "Record an owner for each service account and confirm "
+                "the shared mailbox is restricted and monitored.",
+                items=[u.get("name") for u in shared_users],
+                effort="Low"
             )
 
         public_buckets = [
-            r for r in of_type("Object Storage Bucket")
+            r for r in buckets
             if r.get("public_access_type")
             and r["public_access_type"] != "NoPublicAccess"
         ]
@@ -3659,26 +4286,130 @@ class OCIHealthCheck:
                 "These buckets allow anonymous access to their objects.",
                 "Make the buckets private and share objects with "
                 "pre-authenticated requests where needed.",
-                items=[r.get("name") for r in public_buckets]
+                items=[r.get("name") for r in public_buckets],
+                effort="Low",
+                section="object-storage"
             )
 
-        public_ip_instances = [
-            r for r in instances
-            if r.get("public_ip") not in (
+        # Operating systems at or near end of vendor support.
+        today = self.report_time.date()
+        os_groups = {}
+        for r in instances:
+            os_name = str(r.get("os") or "").lower()
+            for prefix, label, end_date in OS_END_OF_SUPPORT:
+                if os_name.startswith(prefix):
+                    days_left = (
+                        datetime.date.fromisoformat(end_date) - today
+                    ).days
+                    if days_left <= OS_END_OF_SUPPORT_WARN_DAYS:
+                        os_groups.setdefault(
+                            (label, end_date, days_left), []
+                        ).append(r)
+                    break
+        if os_groups:
+            nearest = min(key[2] for key in os_groups)
+            add(
+                "high" if nearest <= OS_END_OF_SUPPORT_URGENT_DAYS
+                else "medium",
+                "Security",
+                f"{sum(len(v) for v in os_groups.values())} instance(s) "
+                f"on an operating system at or near end of support",
+                " ".join(
+                    f"{label}: {_plural(len(group), 'instance')}, "
+                    "vendor support "
+                    + (
+                        f"ended on {end_date}."
+                        if days_left < 0
+                        else f"ends on {end_date} ({days_left} days)."
+                    )
+                    for (label, end_date, days_left), group
+                    in os_groups.items()
+                ),
+                "Plan the upgrade or rebuild now. If it cannot finish "
+                "before the deadline, arrange extended security updates "
+                "and restrict the instance's network access until it "
+                "is upgraded.",
+                items=[
+                    r.get("name")
+                    for group in os_groups.values() for r in group
+                ],
+                effort="High",
+                section="compute-instances"
+            )
+
+        def has_public_ip(resource):
+            return resource.get("public_ip") not in (
                 None, "", "None", "Unknown", "No VNIC"
             )
-        ]
+
+        public_ip_instances = [r for r in instances if has_public_ip(r)]
         if public_ip_instances:
+            running_public = [
+                r for r in public_ip_instances
+                if r.get("state") == "RUNNING"
+            ]
             add(
-                "low",
+                "medium" if running_public else "low",
                 "Security",
                 f"{len(public_ip_instances)} instance(s) with a public IP",
                 "Instances exposed directly to the internet increase "
-                "the attack surface.",
+                f"the attack surface. {len(running_public)} of them "
+                f"are running now and "
+                f"{len(public_ip_instances) - len(running_public)} are "
+                "stopped, which would be exposed again as soon as they "
+                "start.",
                 "Confirm each needs a public IP; restrict ingress with "
                 "NSGs/security lists, or move behind a load balancer, "
                 "WAF or the Bastion service.",
-                items=[r.get("name") for r in public_ip_instances]
+                items=[r.get("name") for r in public_ip_instances],
+                effort="Medium",
+                section="compute-instances"
+            )
+
+        period_start = cost.get("start_date") or ""
+        new_public = [
+            r for r in public_ip_instances
+            if period_start and (r.get("time_created") or "") >= period_start
+        ]
+        if new_public:
+            add(
+                "medium",
+                "Security",
+                f"{len(new_public)} instance(s) created this period with "
+                f"a public IP",
+                "New internet-facing instances should be checked "
+                "against the change record, because they did not exist "
+                "in the previous review.",
+                "Confirm a change request covers each instance and that "
+                "its security rules allow only the required sources.",
+                items=[r.get("name") for r in new_public],
+                effort="Low",
+                section="compute-instances"
+            )
+
+        def is_public_address(address):
+            try:
+                return not ipaddress.ip_address(address).is_private
+            except ValueError:
+                return False
+
+        public_lbs = [
+            r for r in of_type("Load Balancer")
+            if any(is_public_address(ip) for ip in r.get("ip_addresses", []))
+        ]
+        if public_lbs:
+            add(
+                "low",
+                "Security",
+                f"{len(public_lbs)} internet-facing load balancer(s)",
+                "These load balancers have public IP addresses and are "
+                "the main entry point to the applications behind them.",
+                "Confirm each is protected by WAF, accepts TLS 1.2 or "
+                "later only, and is still needed, especially those "
+                "serving test or UAT environments.",
+                items=[r.get("name") for r in public_lbs],
+                effort="Medium",
+                section="networking"
             )
 
         # ----------------------------------------------------
@@ -3686,9 +4417,8 @@ class OCIHealthCheck:
         # ----------------------------------------------------
 
         no_policy = [
-            r for r in resources
-            if r.get("resource_type") in ("Block Volume", "Boot Volume")
-            and r.get("backup_policy_status") == "NOT_ATTACHED"
+            r for r in volumes
+            if r.get("backup_policy_status") == "NOT_ATTACHED"
         ]
         if no_policy:
             add(
@@ -3699,7 +4429,8 @@ class OCIHealthCheck:
                 "cannot be restored after deletion or corruption.",
                 "Attach a Bronze/Silver/Gold or custom backup policy, "
                 "or document why the volume does not need backups.",
-                items=[r.get("name") for r in no_policy]
+                items=[r.get("name") for r in no_policy],
+                effort="Low"
             )
 
         if data.get("backup_issues"):
@@ -3713,7 +4444,8 @@ class OCIHealthCheck:
                 "policy is attached.",
                 "Check the policy schedule and the Block Volume "
                 "work requests for failed backup jobs.",
-                items=[i.get("name") for i in data["backup_issues"]]
+                items=[i.get("name") for i in data["backup_issues"]],
+                effort="Low"
             )
 
         faulty = [
@@ -3730,14 +4462,71 @@ class OCIHealthCheck:
                 "so DR recovery points may be missing.",
                 "Check replication status in the DR region and "
                 "re-enable replication if required.",
-                items=[r.get("name") for r in faulty]
+                items=[r.get("name") for r in faulty],
+                effort="Medium",
+                section="replication"
+            )
+
+        running_regions = sorted({r.get("region") for r in running})
+        if (
+            len(running_regions) == 1
+            and not data.get("replication")
+            and not self.region_filter
+        ):
+            add(
+                "medium",
+                "Reliability",
+                f"Compute and block storage have no cross-region "
+                f"replica",
+                f"All running instances are in {running_regions[0]} and "
+                "no volume replicas exist. A regional outage would "
+                "leave these workloads dependent on whatever recovery "
+                "method exists outside OCI block replication.",
+                "Agree recovery time and recovery point targets for "
+                "each production system, then confirm the current "
+                "backup tooling meets them or enable cross-region "
+                "volume replication for those that need it.",
+                effort="High",
+                section="replication"
+            )
+
+        # Numbered nodes (App01/App02) in one fault domain share a
+        # single point of hardware failure.
+        by_group = {}
+        for r in running:
+            group_name = re.sub(r"\d+$", "", str(r.get("name")).strip())
+            if group_name != str(r.get("name")).strip():
+                by_group.setdefault(
+                    (r.get("region"), group_name), []
+                ).append(r)
+        same_fault_domain = [
+            group for group in by_group.values()
+            if len(group) >= 2
+            and group[0].get("fault_domain")
+            and len({r.get("fault_domain") for r in group}) == 1
+        ]
+        if same_fault_domain:
+            add(
+                "medium",
+                "Reliability",
+                f"{len(same_fault_domain)} clustered pair(s) in a single "
+                f"fault domain",
+                "These numbered nodes run in the same fault domain, so "
+                "one hardware failure or maintenance event can take "
+                "down every node at once.",
+                "Move one node of each pair to another fault domain, "
+                "during a maintenance window.",
+                items=[
+                    r.get("name")
+                    for group in same_fault_domain for r in group
+                ],
+                effort="Medium",
+                section="compute-instances"
             )
 
         # ----------------------------------------------------
         # PERFORMANCE
         # ----------------------------------------------------
-
-        name_by_id = {r.get("id"): r.get("name") for r in instances}
 
         for label, key, threshold in [
             ("CPU", "cpu", CPU_HIGH_PERCENT),
@@ -3765,13 +4554,63 @@ class OCIHealthCheck:
                     items=[
                         name_by_id.get(u["instance_id"], u["instance_id"])
                         for u in hot
-                    ]
+                    ],
+                    effort="Medium"
                 )
 
+        # Early warnings, below the sustained-high thresholds above.
+        memory_rising = [
+            u for u in data.get("utilization", [])
+            if u.get("memory") is not None
+            and MEMORY_WARN_PERCENT <= u["memory"] < MEMORY_HIGH_PERCENT
+        ]
+        if memory_rising:
+            add(
+                "medium",
+                "Performance",
+                f"{len(memory_rising)} instance(s) approaching the "
+                f"memory limit",
+                f"Average memory utilization was between "
+                f"{MEMORY_WARN_PERCENT}% and {MEMORY_HIGH_PERCENT}% over "
+                f"the last {self.utilization_days} days.",
+                "Check the trend and add memory before it reaches the "
+                "high threshold. Flex shapes can be resized without "
+                "changing the OCPU count.",
+                items=[
+                    name_by_id.get(u["instance_id"], u["instance_id"])
+                    for u in memory_rising
+                ],
+                effort="Low"
+            )
+
+        cpu_peaks = [
+            u for u in data.get("utilization", [])
+            if u.get("cpu_peak") is not None
+            and u["cpu_peak"] >= CPU_PEAK_WARN_PERCENT
+            and (u.get("cpu") or 0) < CPU_HIGH_PERCENT
+        ]
+        if cpu_peaks:
+            add(
+                "medium",
+                "Performance",
+                f"{len(cpu_peaks)} instance(s) reaching full CPU at peak",
+                f"Hourly CPU peaked at {CPU_PEAK_WARN_PERCENT}% or above "
+                f"even though the {self.utilization_days}-day average "
+                "looks normal, so users may see slowdowns at those "
+                "times.",
+                "Match the peaks to scheduled jobs or backups, spread "
+                "them out where possible, and add OCPUs if the peaks "
+                "come from normal load.",
+                items=[
+                    name_by_id.get(u["instance_id"], u["instance_id"])
+                    for u in cpu_peaks
+                ],
+                effort="Medium"
+            )
+
         no_metrics = [
-            r for r in instances
-            if r.get("state") == "RUNNING"
-            and utilization_by_id.get(r.get("id"), {}).get("cpu") is None
+            r for r in running
+            if utilization_by_id.get(r.get("id"), {}).get("cpu") is None
         ]
         if no_metrics:
             add(
@@ -3783,8 +4622,32 @@ class OCIHealthCheck:
                 "cannot be monitored or rightsized.",
                 "Enable the Compute Instance Monitoring plugin in the "
                 "Oracle Cloud Agent and allow the instance to reach the "
-                "monitoring endpoint (service gateway).",
-                items=[r.get("name") for r in no_metrics]
+                "monitoring endpoint (service gateway). Firewall and "
+                "other vendor appliances need their own monitoring.",
+                items=[r.get("name") for r in no_metrics],
+                effort="Low",
+                section="compute-instances"
+            )
+
+        reporting = [
+            u for u in data.get("utilization", [])
+            if u.get("cpu") is not None
+        ]
+        if reporting and not any(
+            u.get("disk") is not None for u in reporting
+        ):
+            add(
+                "low",
+                "Operations",
+                "File system usage is not being measured",
+                f"None of the {len(reporting)} instances with CPU data "
+                "returned a disk usage figure, so a disk filling up "
+                "will not appear in this report.",
+                "Publish file system usage as a custom OCI metric, or "
+                "feed this report from the server-monitoring tool "
+                "already in place, and alarm at 80%.",
+                effort="Medium",
+                section="compute-instances"
             )
 
         # ----------------------------------------------------
@@ -3792,10 +4655,11 @@ class OCIHealthCheck:
         # ----------------------------------------------------
 
         alarms = data.get("alarms", [])
-        firing = [
-            a for a in alarms
-            if str(a.get("status", "")).upper() == "FIRING"
-        ]
+
+        def alarm_status(alarm):
+            return str(alarm.get("status", "")).upper()
+
+        firing = [a for a in alarms if alarm_status(a) == "FIRING"]
         if firing:
             add(
                 "high",
@@ -3804,7 +4668,8 @@ class OCIHealthCheck:
                 "These alarms are in the FIRING state now.",
                 "Investigate each alarm and resolve the underlying "
                 "condition.",
-                items=[a.get("name") for a in firing]
+                items=[a.get("name") for a in firing],
+                effort="Medium"
             )
 
         if instances and len(alarms) < max(1, len(instances) // 10):
@@ -3817,24 +4682,69 @@ class OCIHealthCheck:
                 "found when users report them.",
                 "Create alarms for CPU, memory, disk, instance health "
                 "and load balancer backend health, routed to a "
-                "Notifications topic monitored by the operations team."
+                "Notifications topic monitored by the operations team.",
+                effort="Medium"
             )
 
-        no_data_alarms = [
-            a for a in alarms
-            if str(a.get("status", "")).upper() == "NO DATA"
-        ]
+        disabled_alarms = [a for a in alarms if alarm_status(a) == "DISABLED"]
+        if disabled_alarms:
+            critical_disabled = [
+                a for a in disabled_alarms
+                if str(a.get("severity", "")).upper() == "CRITICAL"
+            ]
+            add(
+                "medium" if critical_disabled else "low",
+                "Operations",
+                f"{len(disabled_alarms)} alarm(s) disabled",
+                f"{len(critical_disabled)} of these are marked critical. "
+                "A disabled alarm stays silent even when the condition "
+                "it watches occurs.",
+                "Re-enable each alarm, or delete it and record why it "
+                "is no longer needed.",
+                items=[a.get("name") for a in disabled_alarms],
+                effort="Low"
+            )
+
+        no_data_alarms = [a for a in alarms if alarm_status(a) == "NO DATA"]
         if no_data_alarms:
             add(
                 "low",
                 "Operations",
-                f"{len(no_data_alarms)} alarm(s) receiving no data",
-                "These alarms cannot fire because their metric query "
-                "returns nothing (wrong resource name, or the metric "
-                "is not emitted).",
-                "Fix the alarm query or remove the alarm.",
-                items=[a.get("name") for a in no_data_alarms]
+                f"{len(no_data_alarms)} alarm(s) with no reported status",
+                "OCI returned no live status for these enabled alarms. "
+                "The usual causes are a metric query that matches "
+                "nothing, or a resource that no longer exists.",
+                "Open a sample of these alarms in the Console. Fix or "
+                "remove any whose query returns no data.",
+                items=[a.get("name") for a in no_data_alarms],
+                effort="Medium"
             )
+
+        critical_alarms = [
+            a for a in alarms
+            if str(a.get("severity", "")).upper() == "CRITICAL"
+        ]
+        if (
+            len(alarms) >= ALARM_SEVERITY_REVIEW_MIN
+            and len(critical_alarms) / len(alarms)
+            >= ALARM_CRITICAL_SHARE_WARN
+        ):
+            add(
+                "low",
+                "Operations",
+                f"{len(critical_alarms)} of {len(alarms)} alarms are set "
+                f"to critical",
+                "When nearly every alarm is critical, the team cannot "
+                "tell a real outage from a warning.",
+                "Keep critical for service-affecting conditions and "
+                "move early warnings to warning or info severity.",
+                effort="Low"
+            )
+
+        def with_deadline(announcement):
+            deadline = announcement.get("time_one_start")
+            title = announcement.get("title")
+            return f"{title} (by {deadline[:10]})" if deadline else title
 
         action_required = [
             a for a in data.get("announcements", [])
@@ -3851,7 +4761,28 @@ class OCIHealthCheck:
                 "action (e.g. upgrades, certificate or image changes).",
                 "Review each announcement and schedule the required "
                 "change before its deadline.",
-                items=[a.get("title") for a in action_required]
+                items=[with_deadline(a) for a in action_required],
+                effort="Medium",
+                section="announcements"
+            )
+
+        production_events = [
+            a for a in data.get("announcements", [])
+            if a.get("type") == "PRODUCTION_EVENT_NOTIFICATION"
+        ]
+        if production_events:
+            add(
+                "low",
+                "Operations",
+                f"{len(production_events)} active OCI production event "
+                f"notice(s)",
+                "Oracle has an open production event notice affecting "
+                "this tenancy.",
+                "Read the notice and check whether any of the listed "
+                "services are in use here.",
+                items=[a.get("title") for a in production_events],
+                effort="Low",
+                section="announcements"
             )
 
         if self.errors:
@@ -3863,8 +4794,94 @@ class OCIHealthCheck:
                 "See the Collection Errors section; most are fixed by "
                 "granting the reporting user read access to the "
                 "affected service.",
-                items=sorted({str(e.get("section")) for e in self.errors})
+                items=sorted({str(e.get("section")) for e in self.errors}),
+                effort="Low",
+                section="collection-errors"
             )
+
+        # ----------------------------------------------------
+        # GOVERNANCE
+        # ----------------------------------------------------
+
+        in_root = [
+            r for r in of_type(
+                "Compute Instance", "Block Volume", "Boot Volume", "VCN",
+                "Subnet", "Load Balancer", "Object Storage Bucket",
+                "Autonomous Database", "DB System"
+            )
+            if r.get("compartment") == "ROOT"
+        ]
+        if in_root:
+            add(
+                "medium",
+                "Governance",
+                f"{len(in_root)} resource(s) deployed in the root "
+                f"compartment",
+                "Policies written at the root apply tenancy-wide, so "
+                "resources placed here cannot be separated by team or "
+                "environment.",
+                "Move these resources into the appropriate workload "
+                "compartment. Most can be moved without downtime, but "
+                "check policies that refer to them first.",
+                items=[r.get("name") for r in in_root],
+                effort="Medium"
+            )
+
+        nonprod_in_prod = [
+            r for r in of_type(
+                "Compute Instance", "Block Volume", "Boot Volume"
+            )
+            if PROD_COMPARTMENT_PATTERN.search(str(r.get("compartment")))
+            and is_non_production({"name": r.get("name")})
+        ]
+        if nonprod_in_prod:
+            add(
+                "low",
+                "Governance",
+                f"{len(nonprod_in_prod)} non-production resource(s) in "
+                f"production compartments",
+                "These resources are named as development, test or UAT "
+                "but sit in a production compartment, so they share "
+                "production policies and blur the cost breakdown.",
+                "Move them to the matching non-production compartment, "
+                "or rename them if they are actually production.",
+                items=[r.get("name") for r in nonprod_in_prod],
+                effort="Low"
+            )
+
+        searched = data.get("resource_search", [])
+        if searched and not self.region_filter:
+            used_ids = {
+                r.get("compartment") for r in searched
+                if r.get("resource_type") != "Compartment"
+            }
+            compartments = data.get("compartments", [])
+            used_paths = [
+                c.get("path", "") for c in compartments
+                if c.get("id") in used_ids
+            ]
+            empty_compartments = [
+                c for c in compartments
+                if c.get("path") != "ROOT"
+                and c.get("name") != "ManagedCompartmentForPaaS"
+                and not any(
+                    path == c.get("path")
+                    or path.startswith(f"{c.get('path')} / ")
+                    for path in used_paths
+                )
+            ]
+            if empty_compartments:
+                add(
+                    "low",
+                    "Governance",
+                    f"{len(empty_compartments)} compartment(s) with no "
+                    f"resources",
+                    "Empty compartments add to the policy and access "
+                    "review without holding any workload.",
+                    "Delete the compartments that have no planned use.",
+                    items=[c.get("name") for c in empty_compartments],
+                    effort="Low"
+                )
 
         severity_rank = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda r: severity_rank[r["severity"]])
@@ -4030,6 +5047,11 @@ class OCIHealthCheck:
                             exc
                         )
 
+
+            self.reconcile_volume_attachments(
+                clients["compute"],
+                region_resources
+            )
 
             # Generic inventory
             generic = self.collect_resource_search(
@@ -4516,19 +5538,19 @@ class OCIHealthCheck:
                 ]),
 
             "total_block_backup_storage_tb": round(sum(
-                r.get("size_gb", 0) or 0
+                backup_stored_gb(r)
                 for r in total_resources
                 if r.get("resource_type") == "Block Volume Backup"
             ) / 1024, 2),
 
             "total_boot_backup_storage_tb": round(sum(
-                r.get("size_gb", 0) or 0
+                backup_stored_gb(r)
                 for r in total_resources
                 if r.get("resource_type") == "Boot Volume Backup"
             ) / 1024, 2),
 
             "total_backup_storage_tb": round(sum(
-                r.get("size_gb", 0) or 0
+                backup_stored_gb(r)
                 for r in total_resources
                 if r.get("resource_type") in [
                     "Block Volume Backup",
@@ -4648,6 +5670,9 @@ class OCIHealthCheck:
             r for r in self.data["recommendations"]
             if r["severity"] == "high"
         ])
+        self.data["health"] = compute_health_scores(
+            self.data["recommendations"]
+        )
 
         return self.data
 
@@ -5133,7 +6158,7 @@ def _render_cost_trend_line_matplotlib(daily_points, currency):
     grid_color = "#D6E4F5"
     symbol = _currency_symbol(currency)
 
-    fig, ax = plt.subplots(figsize=(11, 4.2), dpi=160)
+    fig, ax = plt.subplots(figsize=(6.6, 4.6), dpi=160)
     fig.patch.set_facecolor(background)
     ax.set_facecolor(background)
 
@@ -5199,83 +6224,2230 @@ def _render_cost_trend_line_matplotlib(daily_points, currency):
     )
 
 
-def reorder_html_sections(html):
+REPORT_CSS = """
+:root {
+    --navy: #2B5AA8;
+    --navy-dark: #1a3d7a;
+    --navy-deep: #0f2550;
+    --accent: #00C2FF;
+    --white: #ffffff;
+    --bg: #F2F6FB;
+    --surface-2: #F7FAFD;
+    --border: #DCE7F3;
+    --text: #1A2740;
+    --muted: #5A6E8A;
+    --good: #0B7F5A;
+    --good-bg: #E3F5EE;
+    --warn: #B45F06;
+    --warn-bg: #FEF2DF;
+    --bad: #B3261E;
+    --bad-bg: #FCE8E6;
+    --info: #2B5AA8;
+    --info-bg: #E6EEF9;
+    --neutral-bg: #EDF1F6;
+}
 
-    section_order = [
-        "recommendations",
-        "region-overview",
-        "compartments",
-        "iam-security",
-        "compute-instances",
-        "volume-policies",
-        "object-storage",
-        "database",
-        "file-storage",
-        "replication",
-        "networking",
-        "alarms",
-        "announcements",
-        "collection-errors",
-        "billing"
-    ]
+* { box-sizing: border-box; }
 
-    sections = {}
+html { scroll-behavior: smooth; scroll-padding-top: 16px; }
 
-    for section_id in section_order:
+body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.55;
+}
 
-        match = re.search(
-            rf'<div id="{re.escape(section_id)}" class="section">',
-            html
+h1, h2, h3, h4, p { margin: 0; }
+a { color: var(--navy); }
+
+.header {
+    background: linear-gradient(120deg, var(--navy-deep), var(--navy) 75%, #0078D4);
+    color: #fff;
+    padding: 28px 40px 26px;
+}
+.header-inner {
+    max-width: 1560px;
+    margin: 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 20px 40px;
+}
+.logo { height: 36px; width: auto; display: block; margin-bottom: 18px; }
+.eyebrow {
+    color: rgba(255,255,255,.72);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
+.header h1 { font-size: 27px; font-weight: 700; line-height: 1.2; }
+.header-meta {
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 3px 16px;
+    font-size: 13px;
+}
+.header-meta dt { color: rgba(255,255,255,.68); }
+.header-meta dd { margin: 0; font-weight: 600; }
+.confidential {
+    max-width: 1560px;
+    margin: 16px auto 0;
+    color: rgba(255,255,255,.68);
+    font-size: 11px;
+}
+
+.layout {
+    max-width: 1560px;
+    margin: 0 auto;
+    padding: 24px 40px 40px;
+    display: grid;
+    grid-template-columns: 228px minmax(0, 1fr);
+    gap: 24px;
+    align-items: start;
+}
+
+.toc {
+    position: sticky;
+    top: 16px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 10px;
+}
+.toc-group {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    margin: 14px 8px 4px;
+}
+.toc-group:first-child { margin-top: 2px; }
+.toc a {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.3;
+    padding: 6px 8px;
+    border-radius: 6px;
+    text-decoration: none;
+}
+.toc a:hover { background: var(--surface-2); }
+.toc a.active { background: var(--info-bg); color: var(--navy-dark); font-weight: 600; }
+.toc-count {
+    flex-shrink: 0;
+    min-width: 20px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 0 5px;
+    border-radius: 9px;
+}
+.toc-count.high { background: var(--bad-bg); color: var(--bad); }
+.toc-count.medium { background: var(--warn-bg); color: var(--warn); }
+.toc-count.low { background: var(--info-bg); color: var(--info); }
+
+.content { min-width: 0; counter-reset: report-section; }
+
+.section {
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px 24px;
+    margin-bottom: 18px;
+}
+.section-head { margin-bottom: 16px; }
+.section h2 { color: var(--navy-dark); font-size: 19px; font-weight: 700; line-height: 1.3; }
+.section.numbered { counter-increment: report-section; }
+.section.numbered h2::before {
+    content: counter(report-section) ". ";
+    color: var(--muted);
+    font-weight: 600;
+}
+.section-intro { color: var(--muted); font-size: 13px; margin-top: 3px; max-width: 860px; }
+.section h3 { color: var(--navy-dark); font-size: 15px; font-weight: 700; margin: 22px 0 8px; }
+.sub-intro { color: var(--muted); font-size: 13px; margin: -4px 0 10px; max-width: 860px; }
+
+.kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+}
+.kpi {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 11px 14px;
+    min-width: 0;
+}
+.kpi-label {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.3;
+    margin-bottom: 3px;
+}
+.kpi-value {
+    color: var(--navy-dark);
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+}
+.kpi-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.kpi.bad .kpi-value, .tone-bad { color: var(--bad); }
+.kpi.warn .kpi-value, .tone-warn { color: var(--warn); }
+.kpi.good .kpi-value, .tone-good { color: var(--good); }
+.kpi-text .kpi-value { font-size: 16px; line-height: 1.35; }
+
+.pill {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.5;
+    padding: 1px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+}
+.pill-good { background: var(--good-bg); color: var(--good); }
+.pill-warn { background: var(--warn-bg); color: var(--warn); }
+.pill-bad { background: var(--bad-bg); color: var(--bad); }
+.pill-info { background: var(--info-bg); color: var(--info); }
+.pill-neutral { background: var(--neutral-bg); color: var(--muted); }
+
+/* Executive summary */
+.exec-top {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 26px;
+    align-items: center;
+    margin-bottom: 18px;
+}
+.score { text-align: center; }
+.score-ring { position: relative; width: 148px; height: 148px; margin: 0 auto 6px; }
+.score-ring svg { display: block; transform: rotate(-90deg); }
+.score-ring circle { fill: none; stroke-width: 11; }
+.score-track { stroke: var(--neutral-bg); }
+.score-number {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 40px;
+    font-weight: 700;
+    line-height: 1;
+}
+.score-number small { color: var(--muted); font-size: 12px; font-weight: 600; margin-top: 4px; }
+.score-grade { font-size: 15px; font-weight: 700; }
+.exec-narrative { font-size: 15px; line-height: 1.6; margin-bottom: 12px; }
+.top-actions h3 { margin: 0 0 6px; }
+.top-actions ol { margin: 0; padding: 0; list-style: none; }
+.top-actions li {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 5px 0;
+    border-top: 1px solid var(--border);
+}
+.top-actions a { color: var(--text); text-decoration: none; font-weight: 600; }
+.top-actions a:hover { color: var(--navy); text-decoration: underline; }
+
+.exec-columns {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+    margin-bottom: 16px;
+}
+.panel { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.panel h3 { margin: 0 0 10px; }
+.bar-row {
+    display: grid;
+    grid-template-columns: minmax(84px, 150px) minmax(50px, 1fr) minmax(44px, auto);
+    gap: 10px;
+    align-items: center;
+    padding: 5px 0;
+    font-size: 13px;
+}
+.bar-row .bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .bar-value { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bar { height: 8px; background: var(--neutral-bg); border-radius: 4px; overflow: hidden; }
+.bar span { display: block; height: 100%; border-radius: 4px; background: var(--navy); }
+.bar .fill-good { background: var(--good); }
+.bar .fill-warn { background: #E08A1E; }
+.bar .fill-bad { background: var(--bad); }
+.bar-row.wrap { grid-template-columns: minmax(0, 1.4fr) minmax(50px, 1fr) minmax(64px, auto); }
+.bar-row.wrap .bar-label { white-space: normal; }
+.panel-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+.glance {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--border);
+    gap: 1px;
+}
+.glance div { background: var(--white); padding: 9px 12px; }
+.glance b { display: block; color: var(--navy-dark); font-size: 17px; line-height: 1.25; }
+.glance span { color: var(--muted); font-size: 12px; }
+
+/* Recommendations */
+.rec-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    margin-bottom: 8px;
+}
+.rec-toolbar .label { color: var(--muted); font-size: 12px; font-weight: 600; margin-right: 2px; }
+.rec-toolbar .divider { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+.chip {
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 3px 11px;
+    cursor: pointer;
+}
+.chip:hover { border-color: var(--navy); }
+.chip[aria-pressed="true"] { background: var(--navy); border-color: var(--navy); color: #fff; }
+.chip.link { border-color: transparent; color: var(--navy); background: none; }
+.rec-empty { color: var(--muted); padding: 14px 0; display: none; }
+
+.rec-group { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .05em; margin: 16px 0 6px; text-transform: uppercase; }
+.rec { border: 1px solid var(--border); border-left-width: 4px; border-radius: 8px; margin-bottom: 8px; background: var(--white); }
+.rec.high { border-left-color: var(--bad); }
+.rec.medium { border-left-color: #E08A1E; }
+.rec.low { border-left-color: var(--navy); }
+.rec summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+}
+.rec summary::-webkit-details-marker { display: none; }
+.rec summary::after {
+    content: "";
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    margin: 0 3px 3px 2px;
+    border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted);
+    transform: rotate(45deg);
+    transition: transform .15s;
+}
+.rec details[open] > summary::after { transform: rotate(-135deg); margin-bottom: -3px; }
+.rec-title { flex: 1; min-width: 0; font-weight: 600; }
+.rec-category { color: var(--muted); font-size: 12px; width: 84px; flex-shrink: 0; }
+.rec-saving { color: var(--good); font-size: 13px; font-weight: 700; white-space: nowrap; }
+.rec-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 210px;
+    gap: 8px 26px;
+    padding: 2px 14px 14px 14px;
+    border-top: 1px solid var(--border);
+}
+.rec-main { padding-top: 12px; }
+.rec-main h4 { color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 2px; }
+.rec-main p { margin-bottom: 10px; }
+.rec-meta { margin: 12px 0 0; font-size: 13px; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; align-self: start; }
+.rec-meta dt { color: var(--muted); }
+.rec-meta dd { margin: 0; font-weight: 600; text-align: right; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag {
+    background: var(--neutral-bg);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    padding: 1px 7px;
+    overflow-wrap: anywhere;
+}
+.more-tags { margin-top: 6px; }
+.more-tags summary { display: inline; padding: 0; color: var(--navy); font-size: 12px; font-weight: 600; }
+.more-tags summary::after { content: none; }
+.more-tags .tags { margin-top: 6px; }
+
+.findings {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+}
+.findings-title { color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; }
+.findings[open] .findings-title { margin-bottom: 4px; }
+.findings a { display: flex; gap: 8px; align-items: baseline; color: var(--text); font-size: 13px; padding: 2px 0; text-decoration: none; }
+.findings a:hover span:last-child { color: var(--navy); text-decoration: underline; }
+
+/* Tables */
+.table-tools { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.table-search {
+    font: inherit;
+    font-size: 13px;
+    width: min(320px, 100%);
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+}
+.table-search:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.table-count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 4px; }
+.table-wrap.tall { max-height: 560px; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #E9F0F9;
+    color: var(--navy-dark);
+    font-size: 12px;
+    font-weight: 700;
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--navy); }
+th[aria-sort="ascending"]::after { content: " \\25B2"; font-size: 9px; }
+th[aria-sort="descending"]::after { content: " \\25BC"; font-size: 9px; }
+td { padding: 7px 10px; border-bottom: 1px solid #EDF2F8; vertical-align: top; overflow-wrap: anywhere; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--surface-2); }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.nowrap { white-space: nowrap; }
+.sub { display: block; color: var(--muted); font-size: 12px; }
+.dim td { color: var(--muted); }
+.mono { font-family: Consolas, Menlo, monospace; font-size: 12px; }
+.muted { color: var(--muted); font-size: 13px; }
+.empty-state { color: var(--muted); padding: 14px 16px; background: var(--surface-2); border: 1px dashed var(--border); border-radius: 8px; }
+.empty-state.ok { color: var(--good); background: var(--good-bg); border-color: transparent; font-weight: 600; }
+
+.util { min-width: 112px; }
+.util-text { font-variant-numeric: tabular-nums; font-size: 12px; }
+.util-text b { font-size: 13px; }
+.util-text span { color: var(--muted); }
+.util-bar { position: relative; height: 5px; background: var(--neutral-bg); border-radius: 3px; margin-top: 3px; }
+.util-bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--navy); }
+.util-bar i.warn { background: #E08A1E; }
+.util-bar i.bad { background: var(--bad); }
+.util-bar u { position: absolute; top: -2px; width: 2px; height: 9px; background: var(--navy-deep); }
+
+/* Billing */
+.cost-charts { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; margin-bottom: 8px; align-items: start; }
+.cost-chart-wrap { border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+.cost-chart { display: block; width: 100%; height: auto; }
+.lead { font-size: 14px; margin-bottom: 14px; max-width: 980px; }
+.inline-bar { display: grid; grid-template-columns: 46px minmax(40px, 1fr); gap: 8px; align-items: center; min-width: 110px; }
+.inline-bar b { font-weight: 400; text-align: right; font-variant-numeric: tabular-nums; }
+
+.footer {
+    background: var(--navy-deep);
+    color: rgba(255,255,255,.72);
+    text-align: center;
+    font-size: 12px;
+    padding: 18px 24px;
+}
+
+@media (max-width: 1100px) {
+    .exec-columns, .cost-charts { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 860px) {
+    .header { padding: 22px 16px; }
+    .layout { display: block; padding: 12px 16px 28px; }
+    .toc {
+        position: static;
+        max-height: 230px;
+        margin-bottom: 12px;
+    }
+    .section { padding: 16px; }
+    .exec-top { grid-template-columns: minmax(0, 1fr); }
+    .glance { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .rec-body { grid-template-columns: minmax(0, 1fr); }
+    .rec-category { display: none; }
+    .rec-saving { display: none; }
+}
+
+@media print {
+    body { background: #fff; font-size: 11px; }
+    .toc, .table-tools, .rec-toolbar { display: none !important; }
+    .layout { display: block; padding: 0; max-width: none; }
+    .section { border: none; border-radius: 0; padding: 12px 0; break-inside: auto; }
+    .table-wrap, .table-wrap.tall { max-height: none; overflow: visible; border: none; }
+    th { position: static; }
+    tr, .rec, .kpi { break-inside: avoid; }
+    .header, .footer, th, .pill, .bar span, .util-bar i {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+    }
+}
+"""
+
+
+REPORT_JS = """
+(function () {
+    "use strict";
+
+    function cellValue(row, index) {
+        var cell = row.cells[index];
+        if (!cell) { return ""; }
+        return cell.hasAttribute("data-sort")
+            ? cell.getAttribute("data-sort")
+            : cell.textContent.trim();
+    }
+
+    function compare(a, b) {
+        var numberA = parseFloat(String(a).replace(/[^0-9.\\-]/g, ""));
+        var numberB = parseFloat(String(b).replace(/[^0-9.\\-]/g, ""));
+        var numeric = /^[^A-Za-z]*[0-9]/.test(a) && /^[^A-Za-z]*[0-9]/.test(b);
+        if (numeric && !isNaN(numberA) && !isNaN(numberB)) {
+            return numberA - numberB;
+        }
+        return String(a).localeCompare(String(b), undefined, { sensitivity: "base" });
+    }
+
+    function enhanceTable(table) {
+        var body = table.tBodies[0];
+        if (!body || body.rows.length < 2) { return; }
+
+        Array.prototype.forEach.call(table.tHead.rows[0].cells, function (header, index) {
+            header.classList.add("sortable");
+            header.tabIndex = 0;
+            function sort() {
+                var ascending = header.getAttribute("aria-sort") !== "ascending";
+                Array.prototype.forEach.call(table.tHead.rows[0].cells, function (other) {
+                    other.removeAttribute("aria-sort");
+                });
+                header.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+                Array.prototype.slice.call(body.rows).sort(function (rowA, rowB) {
+                    var result = compare(cellValue(rowA, index), cellValue(rowB, index));
+                    return ascending ? result : -result;
+                }).forEach(function (row) { body.appendChild(row); });
+            }
+            header.addEventListener("click", sort);
+            header.addEventListener("keydown", function (event) {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    sort();
+                }
+            });
+        });
+
+        if (body.rows.length < 8) { return; }
+
+        var total = body.rows.length;
+        var tools = document.createElement("div");
+        tools.className = "table-tools";
+        var input = document.createElement("input");
+        input.type = "search";
+        input.className = "table-search";
+        input.placeholder = "Filter these rows";
+        input.setAttribute("aria-label", "Filter table rows");
+        var count = document.createElement("span");
+        count.className = "table-count";
+        count.textContent = total + " rows";
+        tools.appendChild(input);
+        tools.appendChild(count);
+        var wrap = table.parentNode;
+        wrap.parentNode.insertBefore(tools, wrap);
+
+        input.addEventListener("input", function () {
+            var term = input.value.trim().toLowerCase();
+            var visible = 0;
+            Array.prototype.forEach.call(body.rows, function (row) {
+                var match = row.textContent.toLowerCase().indexOf(term) !== -1;
+                row.hidden = !match;
+                if (match) { visible += 1; }
+            });
+            count.textContent = term ? visible + " of " + total + " rows" : total + " rows";
+        });
+    }
+
+    function setupRecommendations() {
+        var items = Array.prototype.slice.call(document.querySelectorAll(".rec"));
+        var chips = Array.prototype.slice.call(document.querySelectorAll(".chip[data-filter]"));
+        var groups = Array.prototype.slice.call(document.querySelectorAll(".rec-group"));
+        var empty = document.querySelector(".rec-empty");
+        var active = { severity: "all", category: "all" };
+
+        function apply() {
+            var shown = 0;
+            items.forEach(function (item) {
+                var match = (active.severity === "all" || item.dataset.severity === active.severity)
+                    && (active.category === "all" || item.dataset.category === active.category);
+                item.hidden = !match;
+                if (match) { shown += 1; }
+            });
+            groups.forEach(function (group) {
+                group.hidden = !items.some(function (item) {
+                    return !item.hidden && item.dataset.severity === group.dataset.group;
+                });
+            });
+            if (empty) { empty.style.display = shown ? "none" : "block"; }
+        }
+
+        chips.forEach(function (chip) {
+            chip.addEventListener("click", function () {
+                var filter = chip.dataset.filter;
+                active[filter] = chip.dataset.value;
+                chips.filter(function (other) { return other.dataset.filter === filter; })
+                    .forEach(function (other) {
+                        other.setAttribute("aria-pressed", String(other === chip));
+                    });
+                apply();
+            });
+        });
+
+        var toggle = document.querySelector(".chip[data-toggle]");
+        if (toggle) {
+            toggle.addEventListener("click", function () {
+                var open = toggle.dataset.toggle === "open";
+                items.forEach(function (item) {
+                    item.querySelector("details").open = open;
+                });
+                toggle.dataset.toggle = open ? "close" : "open";
+                toggle.textContent = open ? "Collapse all" : "Expand all";
+            });
+        }
+
+        function openTarget() {
+            var match = /^#(rec-\\d+)$/.exec(window.location.hash);
+            var target = match && document.getElementById(match[1]);
+            if (target) { target.querySelector("details").open = true; }
+        }
+        window.addEventListener("hashchange", openTarget);
+        openTarget();
+    }
+
+    function setupScrollSpy() {
+        if (!("IntersectionObserver" in window)) { return; }
+        var links = {};
+        document.querySelectorAll(".toc a").forEach(function (link) {
+            links[link.getAttribute("href").slice(1)] = link;
+        });
+        var observer = new IntersectionObserver(function (entries) {
+            entries.forEach(function (entry) {
+                if (!entry.isIntersecting) { return; }
+                Object.keys(links).forEach(function (id) {
+                    links[id].classList.toggle("active", id === entry.target.id);
+                });
+            });
+        }, { rootMargin: "-10% 0px -80% 0px" });
+        document.querySelectorAll(".section").forEach(function (section) {
+            observer.observe(section);
+        });
+    }
+
+    document.querySelectorAll("table.data").forEach(enhanceTable);
+    setupRecommendations();
+    setupScrollSpy();
+
+    window.addEventListener("beforeprint", function () {
+        document.querySelectorAll("details").forEach(function (item) {
+            item.open = true;
+        });
+    });
+}());
+"""
+
+
+# Sections in report order: (id, navigation label, navigation group).
+REPORT_SECTIONS = [
+    ("summary", "Executive Summary", "Overview"),
+    ("recommendations", "Recommendations", "Overview"),
+    ("billing", "Billing & Cost", "Cost"),
+    ("compute-instances", "Compute & Utilization", "Infrastructure"),
+    ("volume-policies", "Volumes & Backups", "Infrastructure"),
+    ("database", "Databases", "Infrastructure"),
+    ("object-storage", "Object Storage", "Infrastructure"),
+    ("file-storage", "File Storage", "Infrastructure"),
+    ("replication", "Volume Replication", "Infrastructure"),
+    ("networking", "Networking", "Infrastructure"),
+    ("iam-security", "IAM & Security", "Security & Operations"),
+    ("alarms", "Alarms", "Security & Operations"),
+    ("announcements", "OCI Announcements", "Security & Operations"),
+    ("region-overview", "Regions & Capacity", "Reference"),
+    ("compartments", "Compartments", "Reference"),
+    ("collection-errors", "Collection Errors", "Reference"),
+]
+
+HEALTH_CATEGORIES = [
+    ("Security", 30),
+    ("Reliability", 25),
+    ("Operations", 15),
+    ("Performance", 15),
+    ("Cost", 10),
+    ("Governance", 5),
+]
+
+HEALTH_PENALTIES = {"high": 15, "medium": 5, "low": 1}
+
+FINDINGS_OPEN_LIMIT = 4
+
+STATE_TONES = {
+    "RUNNING": "good", "AVAILABLE": "good", "ACTIVE": "good",
+    "ATTACHED": "good", "OK": "good", "ENABLED": "good",
+    "STOPPED": "warn", "STOPPING": "warn", "STARTING": "warn",
+    "STANDBY": "info", "DETACHED": "warn", "NO DATA": "warn",
+    "DISABLED": "warn", "INACTIVE": "bad", "SUSPENDED": "warn",
+    "FIRING": "bad", "FAILED": "bad", "FAULTY": "bad",
+    "TERMINATED": "neutral",
+}
+
+ANNOUNCEMENT_TONES = {
+    "ACTION_REQUIRED": "bad",
+    "ACTION_RECOMMENDED": "warn",
+    "PRODUCTION_EVENT_NOTIFICATION": "warn",
+    "PLANNED_CHANGE": "info",
+    "SCHEDULED_MAINTENANCE": "info",
+}
+
+
+def compute_health_scores(recommendations):
+    """
+    Score each category from 100 down, by the severity of its open
+    recommendations, then take a weighted average across categories.
+    """
+
+    categories = {}
+
+    for name, weight in HEALTH_CATEGORIES:
+        items = [
+            r for r in recommendations if r.get("category") == name
+        ]
+        counts = {
+            severity: len([
+                r for r in items if r.get("severity") == severity
+            ])
+            for severity in HEALTH_PENALTIES
+        }
+        penalty = sum(
+            HEALTH_PENALTIES[severity] * count
+            for severity, count in counts.items()
         )
+        categories[name] = {
+            "score": max(0, 100 - penalty),
+            "weight": weight,
+            **counts
+        }
 
-        if not match:
-            continue
-
-        depth = 0
-        end = None
-
-        for tag in re.finditer(r'</?div\b[^>]*>', html[match.start():]):
-
-            if tag.group(0).startswith("</"):
-                depth -= 1
-            else:
-                depth += 1
-
-            if depth == 0:
-                end = match.start() + tag.end()
-                break
-
-        if end is not None:
-            sections[section_id] = (
-                match.start(),
-                end,
-                html[match.start():end]
-            )
-
-    if len(sections) < 2:
-        return html
-
-    first_start = min(item[0] for item in sections.values())
-    last_end = max(item[1] for item in sections.values())
-
-    original_region = html[first_start:last_end]
-
-    for start, end, _ in sorted(
-        sections.values(),
-        reverse=True
-    ):
-        original_region = (
-            original_region[:start - first_start]
-            + original_region[end - first_start:]
-        )
-
-    ordered_sections = "\n\n".join(
-        sections[section_id][2]
-        for section_id in section_order
-        if section_id in sections
+    overall = round(
+        sum(c["score"] * c["weight"] for c in categories.values())
+        / sum(c["weight"] for c in categories.values())
     )
 
-    return html[:first_start] + ordered_sections + html[last_end:]
+    return {
+        "score": overall,
+        "grade": _health_grade(overall),
+        "categories": categories
+    }
+
+
+def _health_grade(score):
+    if score >= 85:
+        return "Good"
+    if score >= 70:
+        return "Fair"
+    if score >= 50:
+        return "Needs attention"
+    return "At risk"
+
+
+def _score_tone(score):
+    if score >= 85:
+        return "good"
+    if score >= 50:
+        return "warn"
+    return "bad"
+
+
+def _plural(count, noun):
+    return f"{count:,} {noun}{'' if count == 1 else 's'}"
+
+
+def _signed_money(symbol, amount):
+    rounded = round(amount, 2)
+    sign = "+" if rounded > 0 else "-" if rounded < 0 else ""
+    return f"{sign}{symbol}{abs(rounded):,.2f}"
+
+
+def _pill(text, tone="neutral"):
+    return f'<span class="pill pill-{tone}">{html_escape(text)}</span>'
+
+
+def _state_pill(state):
+    text = str(state if state is not None else "UNKNOWN").upper()
+    return _pill(text, STATE_TONES.get(text, "neutral"))
+
+
+def _kpi(label, value, sub="", tone="", text=False):
+    classes = " ".join(
+        part for part in ("kpi", tone, "kpi-text" if text else "") if part
+    )
+    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    return (
+        f'<div class="{classes}"><div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value">{value}</div>{sub_html}</div>'
+    )
+
+
+def _kpis(*items):
+    return f'<div class="kpis">{"".join(items)}</div>'
+
+
+def _compartment_cell(path):
+    """Show the last compartment name, keeping the full path as a hint."""
+    text = str(path or "N/A")
+    leaf = text.rsplit(" / ", 1)[-1]
+    return (
+        f'<span title="{html_escape(text)}">{html_escape(leaf)}</span>',
+        text
+    )
+
+
+def _table(headers, rows, empty="No data found.", tall=False):
+    """
+    Render a data table. Each header is a label or (label, css class);
+    each cell is HTML or (HTML, sort value). A row may be a dict with
+    "cells" and "class". Callers escape their own cell text.
+    """
+
+    if not rows:
+        return f'<div class="empty-state">{html_escape(empty)}</div>'
+
+    specs = [
+        header if isinstance(header, tuple) else (header, "")
+        for header in headers
+    ]
+
+    head = "".join(
+        f'<th class="{css}" scope="col">{label}</th>' if css
+        else f'<th scope="col">{label}</th>'
+        for label, css in specs
+    )
+
+    body = []
+
+    for row in rows:
+        cells = row["cells"] if isinstance(row, dict) else row
+        row_class = row.get("class", "") if isinstance(row, dict) else ""
+        rendered = []
+        for cell, (_, css) in zip(cells, specs):
+            content, sort_value = (
+                cell if isinstance(cell, tuple) else (cell, None)
+            )
+            attributes = f' class="{css}"' if css else ""
+            if sort_value is not None:
+                attributes += f' data-sort="{html_escape(sort_value)}"'
+            rendered.append(f"<td{attributes}>{content}</td>")
+        row_attribute = f' class="{row_class}"' if row_class else ""
+        body.append(f"<tr{row_attribute}>{''.join(rendered)}</tr>")
+
+    wrap_class = "table-wrap tall" if tall else "table-wrap"
+
+    return (
+        f'<div class="{wrap_class}"><table class="data">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def _utilization_cell(average, peak, high_threshold):
+    if average is None:
+        return ('<span class="muted">N/A</span>', -1)
+
+    width = max(0, min(float(average), 100))
+    tone = (
+        "bad" if average >= high_threshold
+        else "warn" if average >= high_threshold - 10
+        else ""
+    )
+    peak_text = (
+        f" <span>peak {float(peak):.0f}%</span>"
+        if peak is not None else ""
+    )
+    peak_mark = (
+        f'<u style="left:{min(float(peak), 99):.1f}%"></u>'
+        if peak is not None else ""
+    )
+
+    return (
+        f'<div class="util"><div class="util-text"><b>{float(average):.1f}%'
+        f"</b>{peak_text}</div>"
+        f'<div class="util-bar"><i class="{tone}" style="width:{width:.1f}%">'
+        f"</i>{peak_mark}</div></div>",
+        average
+    )
+
+
+def _short_timestamp(value):
+    if not value:
+        return "N/A"
+    text = str(value)
+    return html_escape(f"{text[:10]} {text[11:16]} UTC") if "T" in text else (
+        html_escape(text)
+    )
+
+
+def _short_date(value):
+    return html_escape(str(value)[:10]) if value else "N/A"
+
+
+def _section(section_id, title, intro, body, findings=None, numbered=True):
+    classes = "section numbered" if numbered else "section"
+    intro_html = f'<p class="section-intro">{intro}</p>' if intro else ""
+    return (
+        f'<section id="{section_id}" class="{classes}">'
+        f'<div class="section-head"><h2>{title}</h2>{intro_html}</div>'
+        f'{findings(section_id) if findings else ""}{body}</section>'
+    )
+
+
+def _render_recommendation(rec, index, money, period_days):
+    severity = html_escape(rec["severity"])
+    savings = rec.get("estimated_savings")
+    section = rec.get("section")
+    section_labels = {sid: label for sid, label, _ in REPORT_SECTIONS}
+
+    names = rec.get("affected_all") or rec.get("affected") or []
+    tags_html = ""
+
+    if names:
+        tags = [f'<span class="tag">{html_escape(n)}</span>' for n in names]
+        tags_html = (
+            "<h4>Affected</h4>"
+            f'<div class="tags">{"".join(tags[:10])}</div>'
+        )
+        if len(tags) > 10:
+            tags_html += (
+                '<details class="more-tags">'
+                f"<summary>Show all {len(tags):,}</summary>"
+                f'<div class="tags">{"".join(tags[10:])}</div></details>'
+            )
+
+    meta = [
+        ("Target", html_escape(rec.get("timeframe", "N/A"))),
+        ("Effort", html_escape(rec.get("effort", "N/A"))),
+    ]
+
+    if rec.get("affected_count"):
+        meta.append(("Affected", f'{rec["affected_count"]:,}'))
+
+    if savings:
+        meta.append((
+            f"Saving / {period_days} days",
+            f'<span class="tone-good">{money(savings)}</span>'
+        ))
+
+    if section:
+        meta.append((
+            "Details",
+            f'<a href="#{html_escape(section)}">'
+            f"{html_escape(section_labels.get(section, section))}</a>"
+        ))
+
+    meta_html = "".join(
+        f"<dt>{label}</dt><dd>{value}</dd>" for label, value in meta
+    )
+
+    saving_html = (
+        f'<span class="rec-saving">{money(savings)}</span>' if savings else ""
+    )
+
+    return f"""
+<article class="rec {severity}" id="rec-{index}" data-severity="{severity}" data-category="{html_escape(rec["category"])}">
+<details{" open" if rec["severity"] == "high" else ""}>
+<summary>
+{_pill(rec["severity"].upper(), {"high": "bad", "medium": "warn"}.get(rec["severity"], "info"))}
+<span class="rec-category">{html_escape(rec["category"])}</span>
+<span class="rec-title">{html_escape(rec["title"])}</span>
+{saving_html}
+</summary>
+<div class="rec-body">
+<div class="rec-main">
+<h4>Why it matters</h4>
+<p>{html_escape(rec["detail"])}</p>
+<h4>Recommended action</h4>
+<p>{html_escape(rec["action"])}</p>
+{tags_html}
+</div>
+<dl class="rec-meta">{meta_html}</dl>
+</div>
+</details>
+</article>
+"""
+
+
+def _render_summary(data, ctx):
+    summary = data["summary"]
+    money = ctx["money"]
+    recommendations = data.get("recommendations", [])
+    health = ctx["health"]
+    counts = ctx["severity_counts"]
+    savings = ctx["total_savings"]
+    period_days = summary.get("cost_period_days", 0)
+    tone = _score_tone(health["score"])
+    ring_color = {
+        "good": "var(--good)", "warn": "#E08A1E", "bad": "var(--bad)"
+    }[tone]
+    customer = html_escape(data["metadata"]["customer_name"])
+
+    # ------------------------------------------------ narrative
+    sentences = [
+        f"{customer}'s tenancy is rated "
+        f"<strong>{html_escape(health['grade'].lower())}</strong> this "
+        f"period, with {_plural(counts['high'], 'high-priority item')} and "
+        f"{_plural(counts['medium'], 'medium-priority item')} to address."
+    ]
+
+    if summary.get("cost_status") == "COLLECTED":
+        change_pct = summary.get("cost_change_pct")
+        change_text = (
+            f", {'up' if change_pct >= 0 else 'down'} "
+            f"{abs(change_pct):.1f}% on the previous {period_days} days"
+            if change_pct is not None else ""
+        )
+        sentences.append(
+            f"OCI spend was {money(summary['cost_total'])}{change_text}."
+        )
+        if savings and summary.get("cost_total"):
+            sentences.append(
+                f"The cost recommendations could save about "
+                f"{money(savings)} per {period_days} days, or "
+                f"{savings / summary['cost_total'] * 100:.0f}% of spend."
+            )
+
+    top_items = "".join(
+        f"<li>{_pill(rec['severity'].upper(), 'bad' if rec['severity'] == 'high' else 'warn')}"
+        f'<a href="#rec-{index}">{html_escape(rec["title"])}</a></li>'
+        for index, rec in list(enumerate(recommendations, start=1))[:5]
+        if rec["severity"] in ("high", "medium")
+    )
+
+    top_actions = (
+        f'<div class="top-actions"><h3>Priorities</h3><ol>{top_items}</ol></div>'
+        if top_items else ""
+    )
+
+    # ------------------------------------------------ headline KPIs
+    change = summary.get("cost_change", 0) or 0
+    change_pct = summary.get("cost_change_pct")
+    cost_sub = (
+        f'<span class="tone-{"bad" if change > 0 else "good"}">'
+        f"{change_pct:+.1f}%</span> vs previous {period_days} days"
+        if change_pct is not None else ""
+    )
+    firing = summary.get("firing_alarms", 0)
+
+    kpis = _kpis(
+        _kpi(f"{period_days}-day cost", money(summary["cost_total"]), cost_sub),
+        _kpi(
+            "Monthly run-rate", money(summary["cost_monthly_runrate"]),
+            f'Average {money(summary["cost_avg_daily"])} a day'
+        ),
+        _kpi(
+            f"Potential saving / {period_days} days", money(savings),
+            f"About {money(savings / period_days * 30)} a month"
+            if period_days else "",
+            "good" if savings else ""
+        ),
+        _kpi(
+            "Cloud Guard problems", f'{summary["cloud_guard_problems"]:,}',
+            f'{html_escape(summary["cloud_guard_status"])}, '
+            f'{_plural(summary["cloud_guard_targets"], "target")}',
+            "bad" if summary["cloud_guard_problems"] else "good"
+        ),
+        _kpi(
+            "Firing alarms", f"{firing:,}",
+            f'{_plural(len(data.get("alarms", [])), "alarm")} configured',
+            "bad" if firing else "good"
+        ),
+        _kpi(
+            "Running / stopped VMs",
+            f'{summary["running_vms"]} / {summary["stopped_vms"]}',
+            f'{summary["total_ocpus"]:,.0f} OCPUs, '
+            f'{summary["total_memory_gb"]:,.0f} GB memory'
+        )
+    )
+
+    # ------------------------------------------------ category scores
+    score_rows = ""
+    for name, _ in HEALTH_CATEGORIES:
+        category = health["categories"][name]
+        category_tone = _score_tone(category["score"])
+        parts = [
+            f"{category[severity]} {severity}"
+            for severity in ("high", "medium", "low")
+            if category[severity]
+        ]
+        score_rows += (
+            f'<div class="bar-row" title="{html_escape(", ".join(parts) or "No open items")}">'
+            f'<span class="bar-label">{html_escape(name)}</span>'
+            f'<div class="bar"><span class="fill-{category_tone}" '
+            f'style="width:{category["score"]}%"></span></div>'
+            f'<span class="bar-value">{category["score"]}</span></div>'
+        )
+
+    penalties = ", ".join(
+        f"{points} per {severity} item"
+        for severity, points in HEALTH_PENALTIES.items()
+    )
+    weights = ", ".join(
+        f"{name} {weight}%" for name, weight in HEALTH_CATEGORIES
+    )
+
+    # ------------------------------------------------ savings list
+    saving_items = sorted(
+        (r for r in recommendations if r.get("estimated_savings")),
+        key=lambda r: r["estimated_savings"],
+        reverse=True
+    )
+    largest = saving_items[0]["estimated_savings"] if saving_items else 1
+
+    saving_rows = "".join(
+        f'<div class="bar-row wrap"><span class="bar-label">'
+        f'{html_escape(r["title"])}</span>'
+        f'<div class="bar"><span class="fill-good" style="width:'
+        f'{r["estimated_savings"] / largest * 100:.0f}%"></span></div>'
+        f'<span class="bar-value">{money(r["estimated_savings"])}</span></div>'
+        for r in saving_items
+    ) or '<p class="muted">No savings could be estimated for this period.</p>'
+
+    glance_items = [
+        (f'{summary["regions_scanned"]}', "Regions"),
+        (f'{summary["compartments"]}', "Compartments"),
+        (f'{summary["total_resources"]:,}', "Resources"),
+        (f'{summary["total_vms"]}', "Instances"),
+        (f'{summary["total_volumes"]}', "Volumes"),
+        (f'{summary["total_backups"]:,}', "Backups"),
+        (f'{summary["total_buckets"]}', "Buckets"),
+        (
+            f'{summary["total_db_systems"] + summary["total_autonomous_db"]}',
+            "Databases"
+        ),
+        (f'{summary["total_load_balancers"]}', "Load balancers"),
+        (f'{summary["iam_users"]}', "IAM users"),
+    ]
+
+    glance = "".join(
+        f"<div><b>{value}</b><span>{label}</span></div>"
+        for value, label in glance_items
+    )
+
+    body = f"""
+<div class="exec-top">
+<div class="score">
+<div class="score-ring">
+<svg width="148" height="148" viewBox="0 0 148 148" aria-hidden="true">
+<circle class="score-track" cx="74" cy="74" r="66"/>
+<circle cx="74" cy="74" r="66" stroke="{ring_color}" stroke-linecap="round" pathLength="100" stroke-dasharray="{health["score"]} 100"/>
+</svg>
+<div class="score-number tone-{tone}">{health["score"]}<small>of 100</small></div>
+</div>
+<div class="score-grade tone-{tone}">{html_escape(health["grade"])}</div>
+<div class="muted">Overall status: {html_escape(summary["overall_status"])}</div>
+</div>
+<div>
+<p class="exec-narrative">{" ".join(sentences)}</p>
+{top_actions}
+</div>
+</div>
+{kpis}
+<div class="exec-columns">
+<div class="panel">
+<h3>Health by area</h3>
+{score_rows}
+<p class="panel-note">Each area starts at 100 and loses {html_escape(penalties)}. Weighting: {html_escape(weights)}.</p>
+</div>
+<div class="panel">
+<h3>Where the savings are</h3>
+{saving_rows}
+<p class="panel-note">Estimates per {period_days} days, based on this tenancy's billed amounts. No resource is counted twice.</p>
+</div>
+</div>
+<div class="glance">{glance}</div>
+"""
+
+    return _section(
+        "summary",
+        "Executive Summary",
+        f'Reporting period {html_escape(data["metadata"].get("period_start"))} '
+        f'to {html_escape(data["metadata"].get("period_end"))}.',
+        body,
+        numbered=False
+    )
+
+
+def _render_recommendations(data, ctx):
+    recommendations = data.get("recommendations", [])
+    summary = data["summary"]
+    counts = ctx["severity_counts"]
+    period_days = summary.get("cost_period_days", 0)
+
+    if not recommendations:
+        return _section(
+            "recommendations",
+            "Recommendations",
+            "",
+            '<div class="empty-state ok">No issues requiring action were '
+            "identified for this period.</div>",
+            numbered=False
+        )
+
+    def chip(filter_name, value, label, pressed=False):
+        return (
+            f'<button type="button" class="chip" data-filter="{filter_name}" '
+            f'data-value="{html_escape(value)}" '
+            f'aria-pressed="{"true" if pressed else "false"}">{label}</button>'
+        )
+
+    severity_chips = chip(
+        "severity", "all", f"All ({len(recommendations)})", True
+    ) + "".join(
+        chip(
+            "severity", severity,
+            f"{severity.capitalize()} ({counts[severity]})"
+        )
+        for severity in ("high", "medium", "low")
+        if counts[severity]
+    )
+
+    category_chips = chip("category", "all", "All", True) + "".join(
+        chip(
+            "category", name,
+            f"{name} ({len([r for r in recommendations if r['category'] == name])})"
+        )
+        for name, _ in HEALTH_CATEGORIES
+        if any(r["category"] == name for r in recommendations)
+    )
+
+    blocks = []
+    current = None
+
+    for index, rec in enumerate(recommendations, start=1):
+        if rec["severity"] != current:
+            current = rec["severity"]
+            blocks.append(
+                f'<div class="rec-group" data-group="{current}">'
+                f'{current.capitalize()} priority: '
+                f'{html_escape(RECOMMENDATION_TIMEFRAMES[current].lower())}</div>'
+            )
+        blocks.append(
+            _render_recommendation(rec, index, ctx["money"], period_days)
+        )
+
+    body = f"""
+<div class="rec-toolbar">
+<span class="label">Priority</span>{severity_chips}
+<span class="divider"></span>
+<span class="label">Area</span>{category_chips}
+<span class="divider"></span>
+<button type="button" class="chip link" data-toggle="open">Expand all</button>
+</div>
+<p class="rec-empty">No recommendations match these filters.</p>
+{"".join(blocks)}
+"""
+
+    return _section(
+        "recommendations",
+        "Recommendations",
+        f"{_plural(len(recommendations), 'action')} derived from this "
+        "period's data, with the most urgent first.",
+        body,
+        numbered=False
+    )
+
+
+def _render_billing(data, ctx):
+    summary = data["summary"]
+    cost = data.get("cost", {})
+    money = ctx["money"]
+    symbol = ctx["symbol"]
+    period_days = summary["cost_period_days"]
+
+    if summary["cost_status"] != "COLLECTED":
+        return _section(
+            "billing",
+            "Billing &amp; Cost",
+            "",
+            '<div class="empty-state">Cost data was not collected for this '
+            "run.</div>" + "".join(
+                f'<p class="muted">Note: {html_escape(w)}</p>'
+                for w in summary.get("cost_warnings", [])
+            ),
+            ctx["findings"]
+        )
+
+    current = cost.get("by_service_current", {})
+    previous = cost.get("by_service_previous", {})
+    total_for_pct = sum(current.values()) or 1
+
+    def change_cell(diff, percent):
+        diff = round(diff, 2)
+        tone = "bad" if diff > 0 else "good" if diff < 0 else ""
+        css = f' class="tone-{tone}"' if tone else ""
+        percent_html = (
+            f' <span class="muted">({percent})</span>' if percent else ""
+        )
+        return (
+            f"<span{css}>{_signed_money(symbol, diff)}</span>{percent_html}",
+            diff
+        )
+
+    service_rows = []
+
+    for service in sorted(
+        set(current) | set(previous),
+        key=lambda s: current.get(s, 0),
+        reverse=True
+    ):
+        current_amount = current.get(service, 0)
+        previous_amount = previous.get(service, 0)
+        diff = current_amount - previous_amount
+        percent = (
+            f"{diff / previous_amount * 100:+.1f}%"
+            if previous_amount and round(diff, 2)
+            else "" if previous_amount or not current_amount
+            else "New"
+        )
+        share = current_amount / total_for_pct * 100
+        service_rows.append([
+            html_escape(service),
+            (f"{symbol}{previous_amount:,.2f}", previous_amount),
+            (f"{symbol}{current_amount:,.2f}", current_amount),
+            change_cell(diff, percent),
+            (
+                f'<div class="inline-bar"><b>{share:.1f}%</b>'
+                f'<div class="bar"><span style="width:{share:.1f}%"></span></div></div>',
+                share
+            )
+        ])
+
+    by_resource = cost.get("by_resource", [])
+    resource_amounts = {
+        entry["resource_id"]: entry["amount"] for entry in by_resource
+    }
+
+    resource_rows = [
+        [
+            html_escape(entry.get("resource_name")),
+            html_escape(entry.get("service")),
+            _compartment_cell(entry.get("compartment_name")),
+            (f'{symbol}{entry.get("amount", 0):,.2f}', entry.get("amount", 0))
+        ]
+        for entry in by_resource[:10]
+    ]
+
+    period_start = cost.get("start_date", "")
+
+    new_resources = sorted(
+        (
+            r for r in data.get("resources", [])
+            if r.get("time_created")
+            and r["time_created"] >= period_start
+            and r.get("resource_type")
+            not in NON_INFRASTRUCTURE_RESOURCE_TYPES
+        ),
+        key=lambda r: r["time_created"],
+        reverse=True
+    )
+
+    def new_cost(resource):
+        amount = resource.get("period_cost")
+        if amount is None:
+            amount = resource_amounts.get(resource.get("id"))
+        if amount is None:
+            return ('<span class="muted">Not separately billed</span>', -1)
+        return (f"{symbol}{amount:,.2f}", amount)
+
+    new_rows = [
+        [
+            html_escape(r.get("name")),
+            html_escape(r.get("resource_type")),
+            _short_date(r.get("time_created")),
+            _compartment_cell(r.get("compartment")),
+            new_cost(r)
+        ]
+        for r in new_resources[:25]
+    ]
+
+    change_pct = summary.get("cost_change_pct")
+    if change_pct is not None:
+        word = "an increase" if summary["cost_change"] >= 0 else "a decrease"
+        lead = (
+            f'Spend for the last {period_days} days was '
+            f'{money(summary["cost_total"])}, {word} of '
+            f'{money(abs(summary["cost_change"]))} '
+            f"({abs(change_pct):.1f}%) on the previous period. "
+            f'{html_escape(summary["cost_top_service"])} is the largest '
+            f'service at {money(summary["cost_top_service_amount"])} '
+            f'({summary["cost_top_service_pct"]:.1f}% of total).'
+        )
+    else:
+        lead = (
+            f'Spend for the last {period_days} days was '
+            f'{money(summary["cost_total"])}. A previous-period comparison '
+            "was not available for this run."
+        )
+
+    warnings_html = "".join(
+        f'<p class="muted">Note: {html_escape(warning)}</p>'
+        for warning in summary.get("cost_warnings", [])
+    )
+
+    change = summary["cost_change"]
+
+    body = f"""
+<p class="lead">{lead}</p>
+{warnings_html}
+{_kpis(
+    _kpi("Total cost", money(summary["cost_total"])),
+    _kpi("Previous period", money(summary["cost_previous_total"])),
+    _kpi("Change", _signed_money(symbol, change), tone="bad" if change > 0 else "good"),
+    _kpi("Average daily cost", money(summary["cost_avg_daily"])),
+    _kpi("Monthly run-rate", money(summary["cost_monthly_runrate"])),
+    _kpi(
+        "Highest cost day",
+        html_escape(summary["cost_highest_day"]),
+        money(summary["cost_highest_day_amount"]),
+        text=True
+    ),
+)}
+<div class="cost-charts">
+<div class="cost-chart-wrap">{ctx["cost_chart"]}</div>
+<div class="cost-chart-wrap">{ctx["trend_chart"]}</div>
+</div>
+<h3>Cost by service</h3>
+{_table(
+    ["Service", ("Previous", "num"), ("Current", "num"), ("Change", "num"), "Share of total"],
+    service_rows,
+    empty="No cost data available."
+)}
+<h3>Top cost-generating resources</h3>
+<p class="sub-intro">Only resources that OCI bills by resource identifier appear here.</p>
+{_table(
+    ["Resource", "Service", "Compartment", ("Cost", "num")],
+    resource_rows,
+    empty="No resource-level cost data is available for this period."
+)}
+<h3>New resources this period</h3>
+<p class="sub-intro">Infrastructure created on or after {html_escape(period_start)}, excluding automated backups ({len(new_resources)} found, newest {min(len(new_resources), 25)} shown).</p>
+{_table(
+    ["Resource", "Type", "Created", "Compartment", ("Cost", "num")],
+    new_rows,
+    empty="No new resources were created during this period."
+)}
+<p class="sub-intro" style="margin-top:14px">Cost is allocated here by service, region and compartment. Consistent tags such as Application, Environment and CostCenter would allow a per-application breakdown.</p>
+"""
+
+    return _section(
+        "billing",
+        "Billing &amp; Cost",
+        f"OCI cost for {html_escape(data['metadata'].get('period_start'))} to "
+        f"{html_escape(data['metadata'].get('period_end'))} (UTC, "
+        f"tenancy-wide), compared with the {period_days} days before. Usage "
+        "data can lag by up to 24 hours, so the latest day may be slightly "
+        "low.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_compute(data, ctx):
+    summary = data["summary"]
+    instances = [
+        r for r in data["resources"]
+        if r.get("resource_type") == "Compute Instance"
+    ]
+    utilization_days = data["metadata"].get("utilization_days", 7)
+    show_disk = any(r.get("disk_percent") is not None for r in instances)
+    show_region = len({r.get("region") for r in instances}) > 1
+
+    state_order = {"RUNNING": 0, "STOPPED": 1}
+
+    def build_row(r):
+        ocpus = r.get("ocpus") or 0
+        memory = r.get("memory_gb") or 0
+        public_ip = r.get("public_ip")
+        has_public = public_ip not in (
+            None, "", "None", "Unknown", "No VNIC"
+        )
+        network = html_escape(r.get("private_ip"))
+        if has_public:
+            network += (
+                f'<span class="sub tone-warn">Public {html_escape(public_ip)}</span>'
+            )
+        row = [
+            (
+                f'{html_escape(r.get("name"))}'
+                f'<span class="sub">{_compartment_cell(r.get("compartment"))[0]}</span>',
+                r.get("name")
+            ),
+            _state_pill(r.get("state")),
+            (
+                f'{html_escape(r.get("shape"))}'
+                f'<span class="sub">{ocpus:g} OCPU, {memory:g} GB</span>',
+                ocpus
+            ),
+            html_escape(r.get("os")),
+            network,
+            _utilization_cell(
+                r.get("cpu_percent"), r.get("cpu_peak_percent"),
+                CPU_HIGH_PERCENT
+            ),
+            _utilization_cell(
+                r.get("memory_percent"), r.get("memory_peak_percent"),
+                MEMORY_HIGH_PERCENT
+            ),
+        ]
+        if show_disk:
+            row.append(_utilization_cell(
+                r.get("disk_percent"), r.get("disk_peak_percent"),
+                DISK_HIGH_PERCENT
+            ))
+        if show_region:
+            row.insert(1, html_escape(r.get("region")))
+        return row
+
+    headers = [
+        "Instance", "State", "Shape", "OS", "IP address",
+        "CPU", "Memory"
+    ]
+    if show_disk:
+        headers.append("Disk")
+    if show_region:
+        headers.insert(1, "Region")
+
+    rows = [
+        build_row(r)
+        for r in sorted(
+            instances,
+            key=lambda r: (
+                state_order.get(r.get("state"), 2),
+                -(r.get("cpu_percent") or 0)
+            )
+        )
+    ]
+
+    disk_kpi = (
+        _kpi(
+            f"High disk (&ge;{DISK_HIGH_PERCENT}%)",
+            summary["high_disk"],
+            tone="bad" if summary["high_disk"] else "good"
+        )
+        if show_disk else
+        _kpi("Disk usage", "Not measured", "Not reported by the OCI agent", text=True)
+    )
+
+    def high_kpi(label, count):
+        return _kpi(label, count, tone="bad" if count else "good")
+
+    body = _kpis(
+        _kpi("Instances", summary["total_vms"]),
+        _kpi("Running", summary["running_vms"], tone="good"),
+        _kpi(
+            "Stopped", summary["stopped_vms"],
+            tone="warn" if summary["stopped_vms"] else ""
+        ),
+        _kpi(
+            "Capacity",
+            f'{summary["total_ocpus"]:,.0f} OCPUs',
+            f'{summary["total_memory_gb"]:,.0f} GB memory'
+        ),
+        high_kpi(f"High CPU (&ge;{CPU_HIGH_PERCENT}%)", summary["high_cpu"]),
+        high_kpi(
+            f"High memory (&ge;{MEMORY_HIGH_PERCENT}%)",
+            summary["high_memory"]
+        ),
+        disk_kpi,
+    ) + _table(headers, rows, empty="No compute instances found.", tall=True)
+
+    return _section(
+        "compute-instances",
+        "Compute &amp; Utilization",
+        f"Instance inventory with utilization over the last "
+        f"{utilization_days} days. Bars show the average, and the dark mark "
+        "shows the highest hourly value.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_volumes(data, ctx):
+    summary = data["summary"]
+    volumes = [
+        r for r in data["resources"]
+        if r.get("resource_type") in ("Block Volume", "Boot Volume")
+    ]
+
+    detached = [
+        r for r in volumes if r.get("attachment_status") != "ATTACHED"
+    ]
+
+    rows = []
+
+    for r in sorted(
+        volumes,
+        key=lambda v: (
+            v.get("attachment_status") == "ATTACHED",
+            -(v.get("size_gb") or 0)
+        )
+    ):
+        attached = r.get("attachment_status") == "ATTACHED"
+        policy_status = r.get("backup_policy_status", "UNKNOWN")
+        policy = r.get("backup_policy_name") or policy_status
+        size = r.get("size_gb") or 0
+        rows.append([
+            (
+                f'{html_escape(r.get("name"))}'
+                f'<span class="sub">{_compartment_cell(r.get("compartment"))[0]}</span>',
+                r.get("name")
+            ),
+            html_escape(str(r.get("resource_type")).replace(" Volume", "")),
+            (f"{size:,}", size),
+            (
+                f'{html_escape(r.get("attached_instance"))}'
+                f'<span class="sub">{html_escape(r.get("attachment_type"))}</span>'
+                if attached else _state_pill("DETACHED"),
+                r.get("attached_instance") if attached else "~"
+            ),
+            (
+                _pill(policy, "good")
+                if policy_status == "ATTACHED"
+                else _pill(
+                    "None" if policy_status == "NOT_ATTACHED" else policy,
+                    "bad" if policy_status == "NOT_ATTACHED" else "warn"
+                ),
+                policy
+            )
+        ])
+
+    backup_rows = [
+        [
+            html_escape(r.get("name")),
+            html_escape(r.get("resource_type")),
+            _compartment_cell(r.get("compartment")),
+            f'<span class="mono">{html_escape(r.get("id"))}</span>'
+        ]
+        for r in volumes
+        if r.get("backup_policy_status") == "NOT_ATTACHED"
+    ]
+
+    no_policy = summary["volumes_without_backup_policy"]
+
+    missing_html = (
+        f"<h3>Volumes without a backup policy ({no_policy})</h3>"
+        + _table(["Name", "Type", "Compartment", "OCID"], backup_rows)
+        if backup_rows else
+        '<h3>Backup policy coverage</h3>'
+        '<div class="empty-state ok">Every volume has a backup policy.</div>'
+    )
+
+    body = _kpis(
+        _kpi("Volumes", summary["total_volumes"]),
+        _kpi("Boot storage", f'{summary["total_boot_storage_tb"]:,.2f} TB'),
+        _kpi("Block storage", f'{summary["total_block_storage_tb"]:,.2f} TB'),
+        _kpi(
+            "Detached volumes", len(detached),
+            tone="warn" if detached else "good"
+        ),
+        _kpi(
+            "Without backup policy", no_policy,
+            tone="warn" if no_policy else "good"
+        ),
+        _kpi("Backups", f'{summary["total_backups"]:,}'),
+        _kpi(
+            "Backup storage",
+            f'{summary["total_backup_storage_tb"]:,.2f} TB',
+            f'Boot {summary["total_boot_backup_storage_tb"]:,.2f} TB, '
+            f'block {summary["total_block_backup_storage_tb"]:,.2f} TB'
+        ),
+    ) + _table(
+        ["Volume", "Type", ("Size (GB)", "num"), "Attached to", "Backup policy"],
+        rows,
+        empty="No volumes found.",
+        tall=True
+    ) + missing_html
+
+    return _section(
+        "volume-policies",
+        "Volumes &amp; Backups",
+        "Boot and block volumes with attachment and backup policy status. "
+        "Detached volumes are listed first.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_database(data, ctx):
+    summary = data["summary"]
+
+    rows = [
+        [
+            (
+                f'{html_escape(r.get("name"))}'
+                f'<span class="sub">{_compartment_cell(r.get("compartment"))[0]}</span>',
+                r.get("name")
+            ),
+            html_escape(r.get("resource_type")),
+            html_escape(r.get("region")),
+            _state_pill(r.get("state")),
+            html_escape(r.get("shape")),
+            html_escape(r.get("db_version")),
+            (f'{r.get("cpu_cores", 0) or 0:,.1f}', r.get("cpu_cores", 0) or 0),
+            (f'{r.get("memory_gb", 0) or 0:,.1f}', r.get("memory_gb", 0) or 0),
+            (f'{r.get("storage_gb", 0) or 0:,.1f}', r.get("storage_gb", 0) or 0),
+        ]
+        for r in data["resources"]
+        if r.get("resource_type") in ("DB System", "Autonomous Database")
+    ]
+
+    body = _kpis(
+        _kpi("DB Systems", summary["total_db_systems"]),
+        _kpi("Autonomous Databases", summary["total_autonomous_db"]),
+        _kpi("Total OCPUs", f'{summary["total_db_ocpus"]:,.1f}'),
+        _kpi("Total memory", f'{summary["total_db_memory_gb"]:,.1f} GB'),
+        _kpi("Total storage", f'{summary["total_db_storage_tb"]:,.2f} TB'),
+    ) + _table(
+        [
+            "Database", "Type", "Region", "State", "Shape / workload",
+            "Version", ("OCPUs", "num"), ("Memory (GB)", "num"),
+            ("Storage (GB)", "num")
+        ],
+        rows,
+        empty="No database systems found."
+    )
+
+    return _section(
+        "database",
+        "Databases",
+        "DB Systems and Autonomous Databases across all scanned regions.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_object_storage(data, ctx):
+    summary = data["summary"]
+    buckets = [
+        r for r in data["resources"]
+        if r.get("resource_type") == "Object Storage Bucket"
+    ]
+    public = [
+        r for r in buckets
+        if safe(r.get("public_access_type"), "NoPublicAccess")
+        != "NoPublicAccess"
+    ]
+
+    rows = []
+
+    for r in sorted(buckets, key=lambda b: -(b.get("size_gb") or 0)):
+        access = safe(r.get("public_access_type"), "N/A")
+        size = r.get("size_gb") or 0
+        objects = r.get("object_count") or 0
+        rows.append([
+            (
+                f'{html_escape(r.get("name"))}'
+                f'<span class="sub">{_compartment_cell(r.get("compartment"))[0]}</span>',
+                r.get("name")
+            ),
+            html_escape(r.get("region")),
+            (f"{objects:,}", objects),
+            (f"{size:,.2f}", size),
+            html_escape(r.get("storage_tier")),
+            _pill(
+                "Private" if access == "NoPublicAccess" else access,
+                "good" if access == "NoPublicAccess" else "bad"
+            ),
+            _short_date(r.get("time_created"))
+        ])
+
+    body = _kpis(
+        _kpi("Buckets", summary["total_buckets"]),
+        _kpi("Total size", f'{summary["total_bucket_size_gb"]:,.2f} GB'),
+        _kpi("Total objects", f'{summary["total_bucket_objects"]:,}'),
+        _kpi("Public buckets", len(public), tone="bad" if public else "good"),
+    ) + _table(
+        [
+            "Bucket", "Region", ("Objects", "num"), ("Size (GB)", "num"),
+            "Tier", "Public access", "Created"
+        ],
+        rows,
+        empty="No buckets found.",
+        tall=True
+    )
+
+    return _section(
+        "object-storage",
+        "Object Storage",
+        "Buckets across all scanned regions, largest first. Object counts "
+        "and sizes are approximate.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_file_storage(data, ctx):
+    summary = data["summary"]
+
+    rows = [
+        [
+            html_escape(r.get("name")),
+            html_escape(r.get("region")),
+            _compartment_cell(r.get("compartment")),
+            _state_pill(r.get("state")),
+            html_escape(r.get("availability_domain")),
+            (f'{r.get("size_gb", 0) or 0:,.2f}', r.get("size_gb", 0) or 0),
+            _short_date(r.get("time_created"))
+        ]
+        for r in data["resources"]
+        if r.get("resource_type") == "File System"
+    ]
+
+    body = (
+        _kpis(
+            _kpi("File systems", summary["total_file_systems"]),
+            _kpi(
+                "Storage used",
+                f'{summary["total_file_storage_tb"]:,.3f} TB'
+            ),
+        ) if rows else ""
+    ) + _table(
+        [
+            "Name", "Region", "Compartment", "State", "Availability domain",
+            ("Size (GB)", "num"), "Created"
+        ],
+        rows,
+        empty="No file systems exist in the scanned regions."
+    )
+
+    return _section(
+        "file-storage",
+        "File Storage",
+        "NFS file systems with metered storage used.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_replication(data, ctx):
+    summary = data["summary"]
+
+    rows = [
+        [
+            html_escape(r.get("name")),
+            html_escape(r.get("resource_type")),
+            html_escape(r.get("region")),
+            _compartment_cell(r.get("compartment")),
+            _state_pill(r.get("state")),
+            html_escape(r.get("destination_region")),
+            _short_timestamp(r.get("time_last_synced"))
+        ]
+        for r in data.get("replication", [])
+    ]
+
+    body = (
+        _kpis(
+            _kpi("Replicas", summary["replicas"]),
+            _kpi(
+                "Healthy",
+                summary["replicas"] - summary["faulty_replicas"],
+                tone="good"
+            ),
+            _kpi(
+                "Replica storage",
+                f'{summary["total_replica_storage_tb"]:,.2f} TB'
+            ),
+        ) if rows else ""
+    ) + _table(
+        [
+            "Name", "Type", "Region", "Compartment", "State",
+            "Destination", "Last synced"
+        ],
+        rows,
+        empty="No volume replicas are configured."
+    )
+
+    return _section(
+        "replication",
+        "Volume Replication",
+        "Healthy replicas are AVAILABLE. Any other state needs investigation.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_networking(data, ctx):
+    summary = data["summary"]
+    network_types = (
+        "VCN", "Subnet", "NAT Gateway", "Internet Gateway", "Service Gateway"
+    )
+
+    def is_public(ip):
+        try:
+            return not ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    load_balancers = []
+
+    for r in data["resources"]:
+        if r.get("resource_type") != "Load Balancer":
+            continue
+        ips = [ip for ip in r.get("ip_addresses", []) if ip]
+        public = any(is_public(ip) for ip in ips)
+        load_balancers.append([
+            (
+                f'{html_escape(r.get("name"))}'
+                f'<span class="sub">{_compartment_cell(r.get("compartment"))[0]}</span>',
+                r.get("name")
+            ),
+            html_escape(r.get("lb_type", "Classic")),
+            html_escape(r.get("shape")),
+            _pill("Public", "warn") if public else _pill("Private", "neutral"),
+            html_escape(", ".join(ips) or "No IP assigned"),
+            _state_pill(r.get("state"))
+        ])
+
+    other_rows = [
+        [
+            html_escape(r.get("name")),
+            html_escape(r.get("resource_type")),
+            html_escape(r.get("region")),
+            _compartment_cell(r.get("compartment")),
+            _state_pill(r.get("state"))
+        ]
+        for r in data["resources"]
+        if r.get("resource_type") in network_types
+    ]
+
+    body = _kpis(
+        _kpi("VCNs", summary["total_vcns"]),
+        _kpi("Subnets", summary["total_subnets"]),
+        _kpi("VNICs", summary["total_vnics"]),
+        _kpi("Load balancers", summary["total_load_balancers"]),
+        _kpi("Gateways", summary["total_gateways"], "NAT, internet, service"),
+    ) + "<h3>Load balancers</h3>" + _table(
+        ["Name", "Type", "Shape", "Exposure", "IP address", "State"],
+        load_balancers,
+        empty="No load balancers found."
+    ) + "<h3>VCNs, subnets and gateways</h3>" + _table(
+        ["Name", "Type", "Region", "Compartment", "State"],
+        other_rows,
+        empty="No network resources found.",
+        tall=True
+    )
+
+    return _section(
+        "networking",
+        "Networking",
+        "Core networking resources across all scanned regions.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_iam(data, ctx):
+    summary = data["summary"]
+    users = data["iam"].get("users", [])
+    active = [u for u in users if str(u.get("state")).upper() == "ACTIVE"]
+    no_mfa = [u for u in active if u.get("mfa") is False]
+    admins = [u for u in active if ADMIN_GROUP_NAME in (u.get("groups") or [])]
+    coverage = (
+        (len(active) - len(no_mfa)) / len(active) * 100 if active else 0
+    )
+
+    def risk_order(user):
+        is_active = str(user.get("state")).upper() == "ACTIVE"
+        return (
+            not is_active,
+            user.get("mfa") is not False,
+            ADMIN_GROUP_NAME not in (user.get("groups") or []),
+            str(user.get("name")).lower()
+        )
+
+    rows = []
+
+    for user in sorted(users, key=risk_order):
+        is_active = str(user.get("state")).upper() == "ACTIVE"
+        name = str(user.get("name"))
+        email = user.get("email")
+        email_html = (
+            f'<span class="sub">{html_escape(email)}</span>'
+            if email and str(email).lower() != name.lower() else ""
+        )
+        mfa = user.get("mfa")
+        mfa_pill = (
+            _pill("Enabled", "good") if mfa is True
+            else _pill("Off", "bad" if is_active else "neutral")
+            if mfa is False else _pill("Unknown", "neutral")
+        )
+        groups = ", ".join(user.get("groups", []))
+        row = [
+            (f"{html_escape(name)}{email_html}", name),
+            _state_pill(user.get("state")),
+            mfa_pill,
+            html_escape(groups) if groups else '<span class="muted">None</span>'
+        ]
+        rows.append({"cells": row, "class": "" if is_active else "dim"})
+
+    body = _kpis(
+        _kpi("Users", summary["iam_users"]),
+        _kpi("Active", len(active)),
+        _kpi("Groups", summary["iam_groups"]),
+        _kpi(
+            "MFA coverage", f"{coverage:.0f}%",
+            f"{len(no_mfa)} active without MFA",
+            "good" if coverage >= 95 else "warn" if coverage >= 75 else "bad"
+        ),
+        _kpi(
+            "Administrators", len(admins),
+            f'{len([u for u in admins if u.get("mfa") is False])} without MFA'
+        ),
+        _kpi(
+            "Cloud Guard", html_escape(summary["cloud_guard_status"]),
+            f'{summary["cloud_guard_problems"]:,} open problems',
+            text=True
+        ),
+    ) + _table(
+        ["User", "State", "MFA", "Groups"],
+        rows,
+        empty="No users were collected.",
+        tall=True
+    )
+
+    return _section(
+        "iam-security",
+        "IAM &amp; Security",
+        "Tenancy users and group memberships, with active users lacking "
+        "MFA listed first.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_alarms(data, ctx):
+    alarms = data.get("alarms", [])
+    order = {"FIRING": 0, "DISABLED": 1, "NO DATA": 2}
+
+    def status_of(alarm):
+        return str(alarm.get("status", "")).upper()
+
+    def count(status):
+        return len([a for a in alarms if status_of(a) == status])
+
+    rows = [
+        [
+            html_escape(a.get("name")),
+            _state_pill(status_of(a)),
+            html_escape(a.get("severity")),
+            _compartment_cell(a.get("compartment")),
+            html_escape(a.get("region"))
+        ]
+        for a in sorted(
+            alarms,
+            key=lambda a: (order.get(status_of(a), 3), str(a.get("name")))
+        )
+    ]
+
+    firing = count("FIRING")
+    disabled = count("DISABLED")
+    no_status = count("NO DATA")
+
+    body = _kpis(
+        _kpi("Alarms", len(alarms)),
+        _kpi("Firing", firing, tone="bad" if firing else "good"),
+        _kpi("OK", count("OK")),
+        _kpi("No reported status", no_status, tone="warn" if no_status else ""),
+        _kpi("Disabled", disabled, tone="warn" if disabled else ""),
+    ) + _table(
+        ["Alarm", "Status", "Severity", "Compartment", "Region"],
+        rows,
+        empty="No alarms are configured.",
+        tall=True
+    )
+
+    return _section(
+        "alarms",
+        "Alarms",
+        "Configured alarms and their current status, with firing and "
+        "disabled alarms first.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_announcements(data, ctx):
+    grouped = {}
+
+    for item in data.get("announcements", []):
+        key = (item.get("type"), item.get("title"))
+        grouped.setdefault(key, []).append(item)
+
+    rows = []
+
+    for (kind, title), items in sorted(
+        grouped.items(),
+        key=lambda pair: (
+            pair[0][0] != "ACTION_REQUIRED", str(pair[0][0])
+        )
+    ):
+        first = items[0]
+        repeat = (
+            f' <span class="muted">({len(items)} notices)</span>'
+            if len(items) > 1 else ""
+        )
+        text = str(kind)
+        rows.append([
+            _pill(
+                text.replace("_", " ").title(),
+                ANNOUNCEMENT_TONES.get(text, "neutral")
+            ),
+            f"{html_escape(title)}{repeat}",
+            html_escape(first.get("lifecycle_state")),
+            _short_date(first.get("time_one_start")),
+            _short_date(first.get("time_one_end"))
+        ])
+
+    body = _table(
+        ["Type", "Title", "Lifecycle", "Date", "End"],
+        rows,
+        empty="No active announcements in this period."
+    )
+
+    return _section(
+        "announcements",
+        "OCI Announcements",
+        f'Active Oracle notices from the last '
+        f'{data["metadata"].get("announcement_days", 7)} days.',
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_regions(data, ctx):
+    summary = data["summary"]
+
+    rows = [
+        [
+            html_escape(region["region"]),
+            (f'{region["running_vms"]}', region["running_vms"]),
+            (f'{region["stopped_vms"]}', region["stopped_vms"]),
+            (f'{region["vcns"]}', region["vcns"]),
+            (f'{region["subnets"]}', region["subnets"]),
+            (f'{region["load_balancers"]}', region["load_balancers"])
+        ]
+        for region in data["regions"]
+    ]
+
+    os_counts = summary["os_family_counts"]
+
+    body = _table(
+        [
+            "Region", ("Running VMs", "num"), ("Stopped VMs", "num"),
+            ("VCNs", "num"), ("Subnets", "num"), ("Load balancers", "num")
+        ],
+        rows,
+        empty="No regions were scanned."
+    ) + '<div style="height:14px"></div>' + _kpis(
+        _kpi("Linux instances", os_counts.get("Linux", 0)),
+        _kpi("Windows instances", os_counts.get("Windows", 0)),
+        _kpi("Other / custom", os_counts.get("Other / Custom", 0)),
+        _kpi("Boot storage", f'{summary["total_boot_storage_tb"]:,.2f} TB'),
+        _kpi("Block storage", f'{summary["total_block_storage_tb"]:,.2f} TB'),
+    )
+
+    return _section(
+        "region-overview",
+        "Regions &amp; Capacity",
+        "Subscribed regions and tenancy-wide operating system and storage "
+        "totals.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_compartments(data, ctx):
+    rows = [
+        [
+            html_escape(c["name"]),
+            html_escape(c["path"]),
+            _state_pill(c["state"])
+        ]
+        for c in data["compartments"]
+    ]
+
+    body = _table(
+        ["Name", "Path", "State"],
+        rows,
+        empty="No compartments were collected.",
+        tall=True
+    )
+
+    return _section(
+        "compartments",
+        "Compartments",
+        f'{_plural(data["summary"]["compartments"], "active compartment")}, '
+        "including the root compartment.",
+        body,
+        ctx["findings"]
+    )
+
+
+def _render_errors(data, ctx):
+    rows = [
+        [
+            html_escape(error["section"]),
+            html_escape(error["region"]),
+            _compartment_cell(error["compartment"]),
+            f'<span class="tone-warn">{html_escape(error["error"])}</span>',
+            html_escape(error.get("hint") or "-")
+        ]
+        for error in data["errors"]
+    ]
+
+    body = (
+        _table(
+            ["Section", "Region", "Compartment", "Error", "Likely cause"],
+            rows,
+            tall=True
+        )
+        if rows else
+        '<div class="empty-state ok">All API calls completed without '
+        "errors.</div>"
+    )
+
+    return _section(
+        "collection-errors",
+        "Collection Errors",
+        "API calls that failed during this run, with a likely cause where "
+        "one is known.",
+        body,
+        ctx["findings"]
+    )
 
 
 def generate_html(data, filename):
@@ -5348,2492 +8520,160 @@ def generate_html(data, filename):
     }.items():
         summary.setdefault(key, default)
 
-    generated = data["metadata"]["generated_at"]
-
-    utilization_rows = ""
-
-    for item in data.get("utilization", []):
-        utilization_rows += f"""
-<tr>
-<td>{html_escape(item.get("region"))}</td>
-<td>{html_escape(item.get("compartment"))}</td>
-<td>{html_escape(item.get("instance_id"))}</td>
-<td>{html_escape(item.get("cpu"))}</td>
-<td>{html_escape(item.get("memory"))}</td>
-<td>{html_escape(item.get("disk"))}</td>
-</tr>
-"""
-
-    missing_policy_rows = ""
-
-    for resource in data.get("resources", []):
-        if (
-            resource.get("resource_type") in [
-                "Block Volume",
-                "Boot Volume"
-            ]
-            and resource.get("backup_policy_status") == "NOT_ATTACHED"
-        ):
-            missing_policy_rows += f"""
-<tr>
-<td>{html_escape(resource.get("region"))}</td>
-<td>{html_escape(resource.get("compartment"))}</td>
-<td>{html_escape(resource.get("resource_type"))}</td>
-<td>{html_escape(resource.get("name"))}</td>
-<td>{html_escape(resource.get("state"))}</td>
-<td>{html_escape(resource.get("id"))}</td>
-</tr>
-"""
-
-    replica_rows = ""
-
-    for replica in data.get("replication", []):
-        state = str(replica.get("state", "UNKNOWN")).upper()
-        state_class = "healthy" if state == "AVAILABLE" else "warning"
-        replica_rows += f"""
-<tr>
-<td>{html_escape(replica.get("region"))}</td>
-<td>{html_escape(replica.get("compartment"))}</td>
-<td>{html_escape(replica.get("resource_type"))}</td>
-<td>{html_escape(replica.get("name"))}</td>
-<td class="{state_class}">{html_escape(state)}</td>
-<td>{html_escape(replica.get("destination_region"))}</td>
-<td>{html_escape(replica.get("time_last_synced"))}</td>
-</tr>
-"""
-
+    metadata = data["metadata"]
+    recommendations = data.get("recommendations", [])
     cost_points = data.get("cost", {}).get("daily", [])
     cost_currency = data.get("cost", {}).get("currency", "USD")
-    cost_amounts = [float(point.get("amount", 0) or 0) for point in cost_points]
-    cost_symbol = _currency_symbol(cost_currency)
+    symbol = _currency_symbol(cost_currency)
 
-    cost_chart_html = build_stacked_cost_chart_html(
-        cost_points, cost_currency
-    )
-    cost_trend_chart_html = build_cost_trend_line_html(
-        cost_points, cost_currency
-    )
+    def money(amount):
+        return f"{symbol}{amount:,.2f}"
 
-    cost_average = (
-        sum(cost_amounts) / len(cost_amounts) if cost_amounts else 0
-    )
+    # ------------------------------------------------ cross-references
+    by_section = {}
 
-    if cost_points and cost_amounts:
-        peak_index = max(
-            range(len(cost_amounts)),
-            key=lambda index: cost_amounts[index]
-        )
-        peak_label = cost_points[peak_index].get("date", "N/A")
-        peak_amount = cost_amounts[peak_index]
-    else:
-        peak_label = "N/A"
-        peak_amount = 0
+    for index, rec in enumerate(recommendations, start=1):
+        by_section.setdefault(rec.get("section"), []).append((index, rec))
 
-    # ----------------------------------------------------
-    # Cost by Service table rows (current vs previous period)
-    # ----------------------------------------------------
-
-    by_service_current = data.get("cost", {}).get(
-        "by_service_current", {}
-    )
-    by_service_previous = data.get("cost", {}).get(
-        "by_service_previous", {}
-    )
-    cost_total_for_pct = sum(by_service_current.values()) or 1
-
-    all_services = sorted(
-        set(by_service_current) | set(by_service_previous),
-        key=lambda s: by_service_current.get(s, 0),
-        reverse=True
-    )
-
-    cost_service_rows_html = ""
-
-    for service in all_services:
-        current_amount = by_service_current.get(service, 0)
-        previous_amount = by_service_previous.get(service, 0)
-        diff = current_amount - previous_amount
-        pct_change = (
-            (diff / previous_amount) * 100 if previous_amount else None
-        )
-        pct_of_total = (current_amount / cost_total_for_pct) * 100
-
-        diff_class = (
-            "danger" if diff > 0 else ("healthy" if diff < 0 else "")
-        )
-
-        pct_change_display = (
-            f"{pct_change:+.1f}%" if pct_change is not None else "New"
-        )
-
-        cost_service_rows_html += f"""
-<tr>
-<td>{html_escape(service)}</td>
-<td>{cost_symbol}{previous_amount:,.2f}</td>
-<td>{cost_symbol}{current_amount:,.2f}</td>
-<td class="{diff_class}">{cost_symbol}{diff:+,.2f}</td>
-<td class="{diff_class}">{pct_change_display}</td>
-<td>{pct_of_total:,.1f}%</td>
-</tr>
-"""
-
-    if not all_services:
-        cost_service_rows_html = (
-            '<tr><td colspan="6" class="muted">'
-            "No cost data available.</td></tr>"
-        )
-
-    # ----------------------------------------------------
-    # Top cost-generating resources
-    # ----------------------------------------------------
-
-    by_resource = data.get("cost", {}).get("by_resource", [])
-
-    cost_top_resources_rows_html = "".join(
-        f"""
-<tr>
-<td>{html_escape(entry.get("resource_name"))}</td>
-<td>{html_escape(entry.get("service"))}</td>
-<td>{html_escape(entry.get("compartment_name"))}</td>
-<td>{cost_symbol}{entry.get("amount", 0):,.2f}</td>
-</tr>
-"""
-        for entry in by_resource[:10]
-    ) or (
-        '<tr><td colspan="4" class="muted">'
-        "No resource-level cost data available for this tenancy/period."
-        "</td></tr>"
-    )
-
-    # ----------------------------------------------------
-    # New resources created during the cost analysis period
-    # ----------------------------------------------------
-
-    cost_period_start = data.get("cost", {}).get("start_date", "")
-    by_resource_amounts = {
-        entry["resource_id"]: entry["amount"] for entry in by_resource
-    }
-
-    new_resources = sorted(
-        (
-            r for r in data.get("resources", [])
-            if r.get("time_created")
-            and r["time_created"] >= cost_period_start
-            and r.get("resource_type")
-            not in NON_INFRASTRUCTURE_RESOURCE_TYPES
-        ),
-        key=lambda r: r["time_created"],
-        reverse=True
-    )
-
-    new_resources_rows_html = "".join(
-        f"""
-<tr>
-<td>{html_escape(r.get("name"))}</td>
-<td>{html_escape(r.get("resource_type"))}</td>
-<td>{html_escape(r.get("time_created", "")[:10])}</td>
-<td>{html_escape(r.get("compartment"))}</td>
-<td>{
-    (cost_symbol + format(r["period_cost"], ",.2f"))
-    if r.get("period_cost") is not None
-    else (cost_symbol + format(by_resource_amounts[r["id"]], ",.2f"))
-    if r.get("id") in by_resource_amounts
-    else "Not separately billed"
-}</td>
-</tr>
-"""
-        for r in new_resources[:25]
-    ) or (
-        '<tr><td colspan="5" class="muted">'
-        "No new resources were created during this period."
-        "</td></tr>"
-    )
-
-    # ----------------------------------------------------
-    # Recommendations -- built during collection (see
-    # OCIHealthCheck.build_recommendations) so the JSON output carries
-    # the same list. The full list renders in its own section; the
-    # cost subset is repeated in the Billing section.
-    # ----------------------------------------------------
-
-    recommendations = data.get("recommendations", [])
-
-    def render_recommendations(items, empty_text):
+    def findings(section_id):
+        items = by_section.get(section_id)
         if not items:
-            return f"""
-<div class="recommendation-item">
-<span class="recommendation-dot good"></span>
-<span>{html_escape(empty_text)}</span>
-</div>
-"""
-        rendered = ""
-        for rec in items:
-            affected = ""
-            if rec.get("affected"):
-                more = rec.get("affected_count", 0) - len(rec["affected"])
-                affected = (
-                    '<div class="recommendation-affected">Affected: '
-                    + html_escape(", ".join(rec["affected"]))
-                    + (f" and {more} more" if more > 0 else "")
-                    + "</div>"
-                )
-            savings = ""
-            if rec.get("estimated_savings"):
-                savings = (
-                    '<div class="recommendation-savings">Estimated '
-                    f'saving: {cost_symbol}'
-                    f'{rec["estimated_savings"]:,.2f} per '
-                    f'{summary.get("cost_period_days", 0)} days</div>'
-                )
-            rendered += f"""
-<div class="recommendation-item">
-<span class="recommendation-dot {html_escape(rec["severity"])}"></span>
-<div>
-<div class="recommendation-title">
-<span class="recommendation-badge {html_escape(rec["severity"])}">{html_escape(rec["severity"].upper())}</span>
-<span class="recommendation-category">{html_escape(rec["category"])}</span>
-{html_escape(rec["title"])}
-</div>
-<div>{html_escape(rec["detail"])}</div>
-<div class="recommendation-action"><strong>Action:</strong> {html_escape(rec["action"])}</div>
-{affected}
-{savings}
-</div>
-</div>
-"""
-        return rendered
+            return ""
+        links = "".join(
+            f'<a href="#rec-{index}">'
+            + _pill(
+                rec["severity"].upper(),
+                {"high": "bad", "medium": "warn"}.get(rec["severity"], "info")
+            )
+            + f'<span>{html_escape(rec["title"])}</span></a>'
+            for index, rec in items
+        )
+        state = " open" if len(items) <= FINDINGS_OPEN_LIMIT else ""
+        return (
+            f'<details class="findings"{state}><summary class="findings-title">'
+            f"Findings in this section ({len(items)})</summary>{links}</details>"
+        )
 
-    all_recommendations_html = render_recommendations(
-        recommendations,
-        "No issues requiring action were identified for this period."
-    )
+    def nav_badge(section_id):
+        items = by_section.get(section_id)
+        if not items:
+            return ""
+        worst = min(
+            (rec["severity"] for _, rec in items),
+            key=["high", "medium", "low"].index
+        )
+        return f'<span class="toc-count {worst}">{len(items)}</span>'
 
-    cost_recommendations_html = render_recommendations(
-        [r for r in recommendations if r.get("category") == "Cost"],
-        "No specific cost-optimization opportunities were identified "
-        "from the available data for this period."
-    )
-
-    recommendation_counts = {
-        severity: len([
-            r for r in recommendations if r.get("severity") == severity
-        ])
-        for severity in ("high", "medium", "low")
+    ctx = {
+        "money": money,
+        "symbol": symbol,
+        "findings": findings,
+        "health": compute_health_scores(recommendations),
+        "severity_counts": {
+            severity: len([
+                r for r in recommendations if r.get("severity") == severity
+            ])
+            for severity in ("high", "medium", "low")
+        },
+        "total_savings": round(sum(
+            r.get("estimated_savings") or 0 for r in recommendations
+        ), 2),
+        "cost_chart": build_stacked_cost_chart_html(
+            cost_points, cost_currency
+        ),
+        "trend_chart": build_cost_trend_line_html(
+            cost_points, cost_currency
+        ),
     }
 
-    total_estimated_savings = round(sum(
-        r.get("estimated_savings") or 0 for r in recommendations
-    ), 2)
+    renderers = {
+        "summary": _render_summary,
+        "recommendations": _render_recommendations,
+        "billing": _render_billing,
+        "compute-instances": _render_compute,
+        "volume-policies": _render_volumes,
+        "database": _render_database,
+        "object-storage": _render_object_storage,
+        "file-storage": _render_file_storage,
+        "replication": _render_replication,
+        "networking": _render_networking,
+        "iam-security": _render_iam,
+        "alarms": _render_alarms,
+        "announcements": _render_announcements,
+        "region-overview": _render_regions,
+        "compartments": _render_compartments,
+        "collection-errors": _render_errors,
+    }
 
-    # ----------------------------------------------------
-    # Executive cost summary paragraph
-    # ----------------------------------------------------
-
-    if summary.get("cost_change_pct") is not None:
-        change_word = (
-            "an increase" if summary["cost_change"] >= 0 else "a decrease"
-        )
-        cost_summary_text = (
-            f"OCI cost for the current {summary.get('cost_period_days', 0)}"
-            f"-day period is {cost_symbol}{summary.get('cost_total', 0):,.2f}"
-            f", compared with {cost_symbol}"
-            f"{summary.get('cost_previous_total', 0):,.2f} during the "
-            f"previous comparable period. This represents {change_word} "
-            f"of {cost_symbol}{abs(summary.get('cost_change', 0)):,.2f} "
-            f"({abs(summary.get('cost_change_pct', 0)):.1f}%). The "
-            f"largest contributor to overall spend is "
-            f"{html_escape(summary.get('cost_top_service'))} at "
-            f"{cost_symbol}{summary.get('cost_top_service_amount', 0):,.2f}"
-            f" ({summary.get('cost_top_service_pct', 0):.1f}% of total), "
-            f"and the service with the largest change versus the "
-            f"previous period is "
-            f"{html_escape(summary.get('cost_top_increase_service'))}."
-        )
-    else:
-        cost_summary_text = (
-            f"OCI cost for the current "
-            f"{summary.get('cost_period_days', 0)}-day period is "
-            f"{cost_symbol}{summary.get('cost_total', 0):,.2f}. A "
-            f"previous-period comparison was not available for this run."
-        )
-
-    cost_warnings_html = "".join(
-        f'<p class="muted">Note: {html_escape(warning)}</p>'
-        for warning in summary.get("cost_warnings", [])
+    sections_html = "\n".join(
+        renderers[section_id](data, ctx)
+        for section_id, _, _ in REPORT_SECTIONS
     )
 
-    html = f"""
-<!DOCTYPE html>
+    nav_parts = []
+    current_group = None
 
-<html>
+    for section_id, label, group in REPORT_SECTIONS:
+        if group != current_group:
+            current_group = group
+            nav_parts.append(
+                f'<div class="toc-group">{html_escape(group)}</div>'
+            )
+        badge = (
+            f'<span class="toc-count low">{len(recommendations)}</span>'
+            if section_id == "recommendations" and recommendations
+            else nav_badge(section_id)
+        )
+        nav_parts.append(
+            f'<a href="#{section_id}"><span>{html_escape(label)}</span>{badge}</a>'
+        )
 
+    customer = html_escape(metadata["customer_name"])
+    report_name = html_escape(metadata["report_name"])
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
 <head>
-
 <meta charset="UTF-8">
-
-<title>
-{html_escape(data["metadata"]["report_name"])}
-</title>
-
-<style>
-
-:root {{
-    --zt-navy: #2B5AA8;
-    --zt-navy-dark: #1a3d7a;
-    --zt-navy-deep: #0f2550;
-    --zt-sky: #4A90D9;
-    --zt-accent: #00C2FF;
-    --zt-white: #ffffff;
-    --zt-offwhite: #F5F8FC;
-    --zt-border: #D6E4F5;
-    --zt-text: #1A2740;
-    --zt-muted: #5A6E8A;
-    --zt-success: #0C9B6E;
-    --zt-warning: #D97706;
-    --zt-danger: #C0392B;
-}}
-
-body {{
-    font-family: "Inter", "Segoe UI", Arial, sans-serif;
-    margin: 0;
-    background: var(--zt-offwhite);
-    color: var(--zt-text);
-    line-height: 1.7;
-}}
-
-.header {{
-
-    background: linear-gradient(135deg, var(--zt-navy-deep), var(--zt-navy), #0078D4);
-    position: relative;
-    overflow: hidden;
-
-    color: white;
-    padding: 36px 40px;
-}}
-
-.header h1 {{
-    margin: 0;
-    font-size: 30px;
-    font-weight: 800;
-}}
-
-.header p {{
-    margin: 8px 0 0;
-    opacity: .78;
-}}
-
-.logo {{
-    height: 42px;
-    width: auto;
-    display: block;
-    margin-bottom: 20px;
-}}
-
-.brand-bar {{
-    color: rgba(255,255,255,.65);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    margin-bottom: 16px;
-}}
-
-.brand-bar span {{ color: var(--zt-accent); }}
-
-.container {{
-    max-width: 1560px;
-    margin: 0 auto;
-    padding: 40px;
-}}
-
-.report-layout {{
-    display: grid;
-    grid-template-columns: 200px minmax(0, 1fr);
-    gap: 32px;
-    align-items: start;
-}}
-
-.toc {{
-    position: sticky;
-    top: 24px;
-    background: var(--zt-white);
-    border: 1px solid var(--zt-border);
-    border-radius: 8px;
-    padding: 20px;
-}}
-
-.toc-title {{
-    color: var(--zt-navy);
-    border-bottom: 2px solid var(--zt-navy);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: .14em;
-    padding-bottom: 10px;
-    text-transform: uppercase;
-}}
-
-.toc a {{
-    color: var(--zt-muted);
-    display: block;
-    font-size: 12px;
-    line-height: 1.4;
-    margin: 8px 0;
-    text-decoration: none;
-}}
-
-.toc a .toc-number {{
-    color: var(--zt-accent);
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 800;
-    margin-right: 6px;
-    min-width: 20px;
-}}
-
-.toc a:hover {{ color: var(--zt-navy); }}
-
-.content {{ min-width: 0; }}
-
-.confidential {{
-    color: rgba(255,255,255,.55);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: .14em;
-    text-transform: uppercase;
-    margin-top: 14px;
-}}
-
-.cards {{
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(180px, 1fr)
-        );
-
-    gap: 15px;
-
-    margin-bottom: 30px;
-}}
-
-.card {{
-    background: var(--zt-white);
-    border: 1px solid var(--zt-border);
-    border-top: 3px solid #0078D4;
-    border-radius: 6px;
-    box-shadow: none;
-    padding: 16px;
-}}
-
-.card .title {{
-
-    color: var(--zt-navy);
-
-    font-size: 13px;
-
-    text-transform:
-        uppercase;
-
-    margin-bottom: 8px;
-}}
-
-.card .value {{
-
-    font-size: 30px;
-
-    font-weight: bold;
-}}
-
-.healthy {{
-    color: #2e7d32;
-}}
-
-.warning {{
-    color: #ef6c00;
-}}
-
-.danger {{
-    color: #c62828;
-}}
-
-.section {{
-    background: var(--zt-white);
-    border: 1px solid var(--zt-border);
-    border-radius: 8px;
-    margin-bottom: 25px;
-    padding: 22px;
-}}
-
-.section h2 {{
-
-    margin-top: 0;
-
-    color: var(--zt-navy-dark);
-    font-size: 18px;
-    font-weight: 700;
-    border-bottom: 1px solid var(--zt-border);
-    padding-bottom: 12px;
-}}
-
-table {{
-
-    width: 100%;
-
-    border-collapse:
-        collapse;
-
-    font-size: 13px;
-}}
-
-th {{
-
-    background: var(--zt-navy);
-    color: white;
-
-    text-align: left;
-
-    padding: 10px;
-}}
-
-td {{
-
-    border-bottom: 1px solid var(--zt-border);
-    padding: 9px;
-}}
-
-.badge {{
-
-    padding:
-        4px 8px;
-
-    border-radius: 12px;
-
-    font-size: 11px;
-
-    font-weight: bold;
-}}
-
-.badge-good {{
-
-    background: #e8f5e9;
-
-    color: #2e7d32;
-}}
-
-.badge-warn {{
-
-    background: #fff3e0;
-
-    color: #ef6c00;
-}}
-
-.badge-bad {{
-
-    background: #ffebee;
-
-    color: #c62828;
-}}
-
-.footer {{
-    background: var(--zt-navy-deep);
-    color: rgba(255,255,255,.55);
-    margin: 0 -40px -40px;
-    
-    text-align: center;
-    font-size: 12px;
-    padding: 25px;
-}}
-
-.cost-metrics {{
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 12px;
-    margin: 16px 0 20px;
-}}
-
-.cost-metric {{
-    background: var(--zt-offwhite);
-    border: 1px solid var(--zt-border);
-    border-radius: 6px;
-    padding: 12px 16px;
-}}
-
-.cost-metric-label {{
-    color: var(--zt-muted);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .06em;
-    text-transform: uppercase;
-    margin-bottom: 4px;
-}}
-
-.cost-metric-value {{
-    color: var(--zt-navy-dark);
-    font-size: 16px;
-    font-weight: 700;
-}}
-
-.cards.cards-4 {{
-    grid-template-columns: repeat(4, 1fr);
-}}
-
-@media only screen and (max-width: 900px) {{
-    .cards.cards-4 {{
-        grid-template-columns: repeat(2, 1fr);
-    }}
-}}
-
-.cost-chart-wrap {{
-    text-align: center;
-}}
-
-.cost-chart {{
-    max-width: 100%;
-    height: auto;
-}}
-
-.recommendations-panel {{
-    background: var(--zt-offwhite);
-    border: 1px solid var(--zt-border);
-    border-radius: 6px;
-    padding: 16px 18px;
-}}
-
-.recommendation-item {{
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 10px 0;
-    border-bottom: 1px solid var(--zt-border);
-    font-size: 13px;
-    line-height: 1.5;
-}}
-
-.recommendation-item:last-child {{
-    border-bottom: none;
-}}
-
-.recommendation-dot {{
-    flex-shrink: 0;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-top: 5px;
-}}
-
-.recommendation-dot.high {{ background: #c62828; }}
-.recommendation-dot.medium {{ background: #ef6c00; }}
-.recommendation-dot.low {{ background: var(--zt-navy); }}
-.recommendation-dot.good {{ background: #2e7d32; }}
-
-.recommendation-title {{
-    font-weight: 600;
-    margin-bottom: 2px;
-}}
-
-.recommendation-badge {{
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    padding: 1px 6px;
-    border-radius: 3px;
-    margin-right: 6px;
-    color: #ffffff;
-    vertical-align: 1px;
-}}
-
-.recommendation-badge.high {{ background: #c62828; }}
-.recommendation-badge.medium {{ background: #ef6c00; }}
-.recommendation-badge.low {{ background: var(--zt-navy); }}
-
-.recommendation-category {{
-    color: var(--zt-muted);
-    font-weight: 500;
-    margin-right: 6px;
-}}
-
-.recommendation-action {{
-    margin-top: 4px;
-}}
-
-.recommendation-affected,
-.recommendation-savings {{
-    margin-top: 4px;
-    color: var(--zt-muted);
-    font-size: 12px;
-}}
-
-.recommendation-savings {{
-    color: var(--zt-success);
-    font-weight: 600;
-}}
-
-.muted {{
-    color: var(--zt-muted);
-    font-size: 13px;
-}}
-
-.section-intro {{
-    color: var(--zt-muted);
-    font-size: 13px;
-    margin: -8px 0 18px;
-    max-width: 720px;
-}}
-
-@media only screen and (max-width: 800px) {{
-    .container {{ padding: 24px 16px 60px; }}
-    .report-layout {{ grid-template-columns: 1fr; }}
-    .toc {{ display: none; }}
-    .header {{ padding: 28px 20px 24px; }}
-}}
-
-</style>
-
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{report_name}</title>
+<style>{REPORT_CSS}</style>
 </head>
-
-
 <body>
 
-
-<div class="header">
-
-<img
-    class="logo"
-    src="data:image/png;base64,{ZAINTECH_LOGO_BASE64}"
-    alt="ZainTECH"
->
-
-<div class="brand-bar">
-ZainTECH <span>&bull;</span> Managed Services <span>&bull;</span> Cloud Health Report
+<header class="header">
+<div class="header-inner">
+<div>
+<img class="logo" src="data:image/png;base64,{ZAINTECH_LOGO_BASE64}" alt="ZainTECH">
+<div class="eyebrow">Managed Services &middot; Cloud Health Report</div>
+<h1>{report_name}</h1>
 </div>
-
-<h1>
-{html_escape(data["metadata"]["report_name"])}
-</h1>
-
-<p>
-Prepared for: {html_escape(data["metadata"]["customer_name"])} |
-Reporting period: {html_escape(data["metadata"].get("period_start"))} to {html_escape(data["metadata"].get("period_end"))} |
-Generated: {html_escape(generated)}
-</p>
-
-<div class="confidential">
-Confidential &mdash; Prepared exclusively for {html_escape(data["metadata"]["customer_name"])} by ZainTECH Managed Services
+<dl class="header-meta">
+<dt>Prepared for</dt><dd>{customer}</dd>
+<dt>Period</dt><dd>{html_escape(metadata.get("period_start"))} to {html_escape(metadata.get("period_end"))}</dd>
+<dt>Generated</dt><dd>{_short_timestamp(metadata["generated_at"])}</dd>
+</dl>
 </div>
+<div class="confidential">Confidential. Prepared exclusively for {customer} by ZainTECH Managed Services.</div>
+</header>
 
-</div>
-
-
-<div class="container">
-
-<div class="report-layout">
-
-<aside class="toc">
-
-<div class="toc-title">
-Contents
-</div>
-
-<a href="#recommendations"><span class="toc-number">&#9733;</span>Key Findings &amp; Recommendations</a>
-<a href="#region-overview"><span class="toc-number">01</span>Region Overview &amp; Infra Summary</a>
-<a href="#compartments"><span class="toc-number">02</span>Compartments</a>
-<a href="#iam-security"><span class="toc-number">03</span>IAM &amp; Security</a>
-<a href="#compute-instances"><span class="toc-number">04</span>Compute &amp; Server Utilization</a>
-<a href="#volume-policies"><span class="toc-number">05</span>Volumes &amp; Backup Policies</a>
-<a href="#object-storage"><span class="toc-number">06</span>Object Storage</a>
-<a href="#database"><span class="toc-number">07</span>Database Systems</a>
-<a href="#file-storage"><span class="toc-number">08</span>File Storage</a>
-<a href="#replication"><span class="toc-number">09</span>Volume Replication</a>
-<a href="#networking"><span class="toc-number">10</span>Networking</a>
-<a href="#alarms"><span class="toc-number">11</span>Alarms &amp; Notifications</a>
-<a href="#announcements"><span class="toc-number">12</span>OCI Announcements</a>
-<a href="#collection-errors"><span class="toc-number">13</span>Collection Errors</a>
-<a href="#billing"><span class="toc-number">14</span>Billing &amp; Cost</a>
-
-</aside>
-
+<div class="layout">
+<nav class="toc" aria-label="Report sections">
+{"".join(nav_parts)}
+</nav>
 <main class="content">
-
-
-<div class="cards">
-
-
-<div class="card">
-
-<div class="title">
-Overall Status
-</div>
-
-<div class="value
-{'healthy' if summary['overall_status'] == 'HEALTHY' else 'warning'}
-">
-
-{html_escape(summary["overall_status"])}
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-IAM Users
-</div>
-
-<div class="value">
-{summary["iam_users"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Running VMs
-</div>
-
-<div class="value">
-{summary["running_vms"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Stopped VMs
-</div>
-
-<div class="value">
-{summary["stopped_vms"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Backup Issues
-</div>
-
-<div class="value">
-{summary["backup_issues"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Firing Alarms
-</div>
-
-<div class="value">
-{summary["firing_alarms"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-OCI Announcements
-</div>
-
-<div class="value">
-{summary["oci_announcements"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Regions Scanned
-</div>
-
-<div class="value">
-{summary["regions_scanned"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Total Resources
-</div>
-
-<div class="value">
-{summary["total_resources"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Total VMs
-</div>
-
-<div class="value">
-{summary["total_vms"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Total Volumes
-</div>
-
-<div class="value">
-{summary["total_volumes"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Total Backups
-</div>
-
-<div class="value">
-{summary["total_backups"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Network Resources
-</div>
-
-<div class="value">
-{summary["total_network_resources"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Cloud Guard
-</div>
-
-<div class="value">
-{html_escape(summary["cloud_guard_status"])}
-</div>
-
-<p>
-Targets: {summary["cloud_guard_targets"]} |
-Problems: {summary["cloud_guard_problems"]}
-</p>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-High CPU (&ge;80%)
-</div>
-
-<div class="value">
-{summary["high_cpu"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-High Memory (&ge;85%)
-</div>
-
-<div class="value">
-{summary["high_memory"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-High Disk (&ge;80%)
-</div>
-
-<div class="value">
-{summary["high_disk"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Volumes Without Policy
-</div>
-
-<div class="value">
-{summary["volumes_without_backup_policy"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-Replica Health
-</div>
-
-<div class="value">
-{summary["replicas"] - summary["faulty_replicas"]}
- / {summary["replicas"]}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="title">
-7-Day Cost ({html_escape(summary["cost_currency"])})
-</div>
-
-<div class="value">
-{summary["cost_total"]:,.2f}
-</div>
-
-</div>
-
-
-</div>
-
-
-<div id="object-storage" class="section">
-
-<h2>
-6. Object Storage
-</h2>
-
-<p class="section-intro">
-Buckets discovered across all scanned regions and compartments, with
-approximate object counts, size, and public-access exposure.
-</p>
-
-<div class="cost-metrics">
-
-<div class="cost-metric">
-<div class="cost-metric-label">Total Buckets</div>
-<div class="cost-metric-value">{summary["total_buckets"]}</div>
-</div>
-
-<div class="cost-metric">
-<div class="cost-metric-label">Total Size</div>
-<div class="cost-metric-value">{summary["total_bucket_size_gb"]:,.2f} GB</div>
-</div>
-
-<div class="cost-metric">
-<div class="cost-metric-label">Total Objects</div>
-<div class="cost-metric-value">{summary["total_bucket_objects"]:,}</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Bucket Name</th>
-<th>Objects</th>
-<th>Size (GB)</th>
-<th>Storage Tier</th>
-<th>Public Access</th>
-<th>Created</th>
-</tr>
-"""
-
-
-    bucket_resources = [
-        r for r in data["resources"]
-        if r.get("resource_type") == "Object Storage Bucket"
-    ]
-
-    if not bucket_resources:
-        html += (
-            '<tr><td colspan="8" class="muted">'
-            "No buckets found.</td></tr>"
-        )
-
-    for resource in bucket_resources:
-
-        public_access = safe(
-            resource.get("public_access_type"), "N/A"
-        )
-
-        html += f"""
-
-<tr>
-<td>{html_escape(resource["region"])}</td>
-<td>{html_escape(resource["compartment"])}</td>
-<td>{html_escape(resource["name"])}</td>
-<td>{resource.get("object_count", 0):,}</td>
-<td>{resource.get("size_gb", 0):,.3f}</td>
-<td>{html_escape(resource.get("storage_tier"))}</td>
-<td class="
-{'warning' if public_access != 'NoPublicAccess' else ''}
-">{html_escape(public_access)}</td>
-<td>{html_escape(resource.get("time_created"))}</td>
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<div id="database" class="section">
-
-<h2>
-7. Database Systems
-</h2>
-
-<p class="section-intro">
-DB Systems and Autonomous Databases across all scanned regions and
-compartments, with allocated CPU, memory, and storage.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">DB Systems</div>
-<div class="value">{summary["total_db_systems"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Autonomous Databases</div>
-<div class="value">{summary["total_autonomous_db"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Total OCPUs</div>
-<div class="value">{summary["total_db_ocpus"]:,.1f}</div>
-</div>
-
-<div class="card">
-<div class="title">Total Memory</div>
-<div class="value">{summary["total_db_memory_gb"]:,.1f} GB</div>
-</div>
-
-<div class="card">
-<div class="title">Total Storage</div>
-<div class="value">{summary["total_db_storage_tb"]:,.2f} TB</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Type</th>
-<th>Name</th>
-<th>State</th>
-<th>Shape / Workload</th>
-<th>Version</th>
-<th>OCPUs</th>
-<th>Memory (GB)</th>
-<th>Storage (GB)</th>
-</tr>
-"""
-
-
-    db_resources = [
-        r for r in data["resources"]
-        if r.get("resource_type") in ("DB System", "Autonomous Database")
-    ]
-
-    if not db_resources:
-        html += (
-            '<tr><td colspan="10" class="muted">'
-            "No database systems found.</td></tr>"
-        )
-
-    for resource in db_resources:
-
-        html += f"""
-
-<tr>
-<td>{html_escape(resource["region"])}</td>
-<td>{html_escape(resource["compartment"])}</td>
-<td>{html_escape(resource["resource_type"])}</td>
-<td>{html_escape(resource["name"])}</td>
-<td class="
-{'healthy' if resource["state"] in ('AVAILABLE', 'ACTIVE') else 'warning'}
-">{html_escape(resource["state"])}</td>
-<td>{html_escape(resource.get("shape"))}</td>
-<td>{html_escape(resource.get("db_version"))}</td>
-<td>{resource.get("cpu_cores", 0):,.1f}</td>
-<td>{resource.get("memory_gb", 0):,.1f}</td>
-<td>{resource.get("storage_gb", 0):,.1f}</td>
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<div id="file-storage" class="section">
-
-<h2>
-8. File Storage
-</h2>
-
-<p class="section-intro">
-NFS file systems across all scanned regions and compartments, with
-metered storage used.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">File Systems</div>
-<div class="value">{summary["total_file_systems"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Total Storage Used</div>
-<div class="value">{summary["total_file_storage_tb"]:,.3f} TB</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Name</th>
-<th>State</th>
-<th>Availability Domain</th>
-<th>Size (GB)</th>
-<th>Created</th>
-</tr>
-"""
-
-
-    file_resources = [
-        r for r in data["resources"]
-        if r.get("resource_type") == "File System"
-    ]
-
-    if not file_resources:
-        html += (
-            '<tr><td colspan="7" class="muted">'
-            "No file systems found.</td></tr>"
-        )
-
-    for resource in file_resources:
-
-        html += f"""
-
-<tr>
-<td>{html_escape(resource["region"])}</td>
-<td>{html_escape(resource["compartment"])}</td>
-<td>{html_escape(resource["name"])}</td>
-<td class="
-{'healthy' if resource["state"] == 'ACTIVE' else 'warning'}
-">{html_escape(resource["state"])}</td>
-<td>{html_escape(resource.get("availability_domain"))}</td>
-<td>{resource.get("size_gb", 0):,.3f}</td>
-<td>{html_escape(resource.get("time_created"))}</td>
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<div id="replication" class="section">
-
-<h2>
-9. Volume Replication
-</h2>
-
-<p class="section-intro">
-Healthy replicas are in AVAILABLE state. Faulty or other states require investigation.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Replicas</div>
-<div class="value">{summary["replicas"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Total Replica Storage</div>
-<div class="value">{summary["total_replica_storage_tb"]:,.2f} TB</div>
-</div>
-
-</div>
-
-<table>
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Type</th>
-<th>Name</th>
-<th>State</th>
-<th>Destination Region</th>
-<th>Last Synced</th>
-</tr>
-{replica_rows}
-</table>
-
-</div>
-
-
-<div id="billing" class="section">
-
-<h2>
-14. Billing &amp; Cost Analysis
-</h2>
-
-<p class="section-intro">
-OCI cost for the last {summary["cost_period_days"]} full days
-({html_escape(data["metadata"].get("period_start"))} to
-{html_escape(data["metadata"].get("period_end"))}, UTC, tenancy-wide),
-compared with the {summary["cost_period_days"]} days before it. OCI
-usage data can lag by up to 24 hours, so the most recent day may be
-slightly understated.
-</p>
-
-<p>
-Status: {html_escape(summary["cost_status"])}
-</p>
-
-{cost_warnings_html}
-
-<p>
-{html_escape(cost_summary_text)}
-</p>
-
-<div class="cards cards-4">
-
-<div class="card">
-<div class="title">Total Cost</div>
-<div class="value">{cost_symbol}{summary["cost_total"]:,.2f}</div>
-</div>
-
-<div class="card">
-<div class="title">Previous Period</div>
-<div class="value">{cost_symbol}{summary["cost_previous_total"]:,.2f}</div>
-</div>
-
-<div class="card">
-<div class="title">Change vs Previous {summary["cost_period_days"]} Days</div>
-<div class="value {'danger' if summary['cost_change'] > 0 else 'healthy'}">{cost_symbol}{summary["cost_change"]:+,.2f}</div>
-</div>
-
-<div class="card">
-<div class="title">Average Daily Cost</div>
-<div class="value">{cost_symbol}{summary["cost_avg_daily"]:,.2f}</div>
-</div>
-
-<div class="card">
-<div class="title">Est. Monthly Run-Rate</div>
-<div class="value">{cost_symbol}{summary["cost_monthly_runrate"]:,.2f}</div>
-</div>
-
-<div class="card">
-<div class="title">Biggest Cost Category</div>
-<div class="value">{html_escape(summary["cost_top_service"])}</div>
-</div>
-
-<div class="card">
-<div class="title">Highest Cost Day</div>
-<div class="value">{html_escape(summary["cost_highest_day"])}</div>
-</div>
-
-<div class="card">
-<div class="title">New Resources This Period</div>
-<div class="value">{summary["cost_new_resources_count"]}</div>
-</div>
-
-</div>
-
-<div class="cost-chart-wrap">
-{cost_chart_html}
-</div>
-
-<div class="cost-chart-wrap">
-{cost_trend_chart_html}
-</div>
-
-<h3>Cost by Service</h3>
-
-<table>
-<tr>
-<th>Service</th>
-<th>Previous Period</th>
-<th>Current Period</th>
-<th>Change</th>
-<th>% Change</th>
-<th>% of Total</th>
-</tr>
-{cost_service_rows_html}
-</table>
-
-<h3>Top Cost-Generating Resources</h3>
-
-<p class="section-intro">
-Individual resources with the highest cost this period, where OCI's
-billing data reports a resource identifier (not every OCI service
-bills at the individual-resource level).
-</p>
-
-<table>
-<tr>
-<th>Resource</th>
-<th>Service</th>
-<th>Compartment</th>
-<th>Current Cost</th>
-</tr>
-{cost_top_resources_rows_html}
-</table>
-
-<h3>New Resources This Period</h3>
-
-<p class="section-intro">
-Infrastructure created on or after {html_escape(cost_period_start)} that
-did not exist in the previous comparable period ({len(new_resources)}
-found, newest {min(len(new_resources), 25)} shown). Automated backups
-are excluded. Cost is shown only where OCI's billing data could be
-matched to the specific resource.
-</p>
-
-<table>
-<tr>
-<th>Resource</th>
-<th>Type</th>
-<th>Created</th>
-<th>Compartment</th>
-<th>Cost Impact</th>
-</tr>
-{new_resources_rows_html}
-</table>
-
-<h3>Cost Optimization Recommendations</h3>
-
-<div class="recommendations-panel">
-{cost_recommendations_html}
-</div>
-
-<p class="section-intro" style="margin-top: 14px;">
-Application- and environment-level cost allocation depends on
-consistent OCI tags (e.g. Application, Environment, CostCenter) across
-resources. This tenancy's resources were not consistently tagged at
-collection time, so this report allocates cost by service, region, and
-compartment instead -- the most reliable dimensions available. Adding
-standardized tags would enable a full per-application cost breakdown
-in future reports.
-</p>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- RECOMMENDATIONS -->
-<!-- ================================================== -->
-
-<div id="recommendations" class="section">
-
-<h2>
-Key Findings &amp; Recommendations
-</h2>
-
-<p class="section-intro">
-Prioritized actions derived from this week's data
-({html_escape(data["metadata"].get("period_start"))} to
-{html_escape(data["metadata"].get("period_end"))}). High-priority items
-should be addressed first.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">High Priority</div>
-<div class="value {'danger' if recommendation_counts['high'] else 'healthy'}">{recommendation_counts["high"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Medium Priority</div>
-<div class="value {'warning' if recommendation_counts['medium'] else 'healthy'}">{recommendation_counts["medium"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Low Priority</div>
-<div class="value">{recommendation_counts["low"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Est. Savings / {summary["cost_period_days"]} days</div>
-<div class="value">{cost_symbol}{total_estimated_savings:,.2f}</div>
-</div>
-
-</div>
-
-<div class="recommendations-panel">
-{all_recommendations_html}
-</div>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- REGION OVERVIEW -->
-<!-- ================================================== -->
-
-<div id="region-overview" class="section">
-
-<h2>
-1. Region Overview &amp; Infrastructure Summary
-</h2>
-
-<p class="section-intro">
-Subscribed regions with running/stopped VM counts, followed by a
-tenancy-wide snapshot of OS mix, compute capacity, and storage
-totals.
-</p>
-
-<table>
-
-<tr>
-
-<th>Region</th>
-<th>Running VMs</th>
-<th>Stopped VMs</th>
-<th>VCNs</th>
-<th>Subnets</th>
-<th>Load Balancers</th>
-
-</tr>
-"""
-
-    for region in data["regions"]:
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(region["region"])}
-</td>
-
-<td>
-{region["running_vms"]}
-</td>
-
-<td class="
-{'danger' if region["stopped_vms"] else 'healthy'}
-">
-{region["stopped_vms"]}
-</td>
-
-<td>
-{region["vcns"]}
-</td>
-
-<td>
-{region["subnets"]}
-</td>
-
-<td>
-{region["load_balancers"]}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-<h3>Infrastructure Summary</h3>
-
-<table>
-
-<tr>
-<th>OS Family</th>
-<th>Instances</th>
-</tr>
-
-<tr>
-<td>Linux</td>
-<td>{summary["os_family_counts"].get("Linux", 0)}</td>
-</tr>
-
-<tr>
-<td>Windows</td>
-<td>{summary["os_family_counts"].get("Windows", 0)}</td>
-</tr>
-
-<tr>
-<td>Other / Custom</td>
-<td>{summary["os_family_counts"].get("Other / Custom", 0)}</td>
-</tr>
-
-</table>
-
-<div class="cost-metrics">
-
-<div class="cost-metric">
-<div class="cost-metric-label">Total CPUs (OCPUs)</div>
-<div class="cost-metric-value">{summary["total_ocpus"]:,.1f}</div>
-</div>
-
-<div class="cost-metric">
-<div class="cost-metric-label">Total RAM</div>
-<div class="cost-metric-value">{summary["total_memory_gb"]:,.1f} GB</div>
-</div>
-
-<div class="cost-metric">
-<div class="cost-metric-label">Boot Storage</div>
-<div class="cost-metric-value">{summary["total_boot_storage_tb"]:,.2f} TB</div>
-</div>
-
-<div class="cost-metric">
-<div class="cost-metric-label">Block Storage</div>
-<div class="cost-metric-value">{summary["total_block_storage_tb"]:,.2f} TB</div>
-</div>
-
-</div>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- IAM -->
-<!-- ================================================== -->
-
-<div id="iam-security" class="section">
-
-<h2>
-3. IAM &amp; Security
-</h2>
-
-<p class="section-intro">
-Users, groups, and policies configured at the tenancy level.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Users</div>
-<div class="value">{summary["iam_users"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Total Groups</div>
-<div class="value">{summary["iam_groups"]}</div>
-</div>
-
-</div>
-
-<h3>Users</h3>
-
-<table>
-
-<tr>
-<th>User</th>
-<th>Email</th>
-<th>State</th>
-<th>MFA</th>
-<th>Groups</th>
-</tr>
-"""
-
-
-    for user in data["iam"].get("users", []):
-
-        mfa = str(user["mfa"])
-
-        mfa_class = (
-            "badge-good"
-            if mfa.lower() == "true"
-            else "badge-warn"
-        )
-
-        groups_display = ", ".join(
-            user.get("groups", [])
-        ) or "None"
-
-        state_class = (
-            "badge-good"
-            if str(user["state"]).upper() == "ACTIVE"
-            else "badge-bad"
-        )
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(user["name"])}
-</td>
-
-<td>
-{html_escape(user["email"])}
-</td>
-
-<td>
-
-<span class="badge {state_class}">
-{html_escape(user["state"])}
-</span>
-
-</td>
-
-<td>
-
-<span class="badge {mfa_class}">
-{html_escape(mfa)}
-</span>
-
-</td>
-
-<td>
-{html_escape(groups_display)}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- COMPUTE INSTANCES -->
-<!-- ================================================== -->
-
-<div id="compute-instances" class="section">
-
-<h2>
-4. Compute Instances &amp; Server Utilization
-</h2>
-
-<p class="section-intro">
-All compute instances found, with OS, networking, and utilization
-for running instances over the last
-{data["metadata"].get("utilization_days", 7)} days, shown as
-average / peak (highest hourly mean).
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Instances</div>
-<div class="value">{summary["total_vms"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Total OCPUs</div>
-<div class="value">{summary["total_ocpus"]:,.1f}</div>
-</div>
-
-<div class="card">
-<div class="title">Total Memory</div>
-<div class="value">{summary["total_memory_gb"]:,.1f} GB</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Name</th>
-<th>State</th>
-<th>Shape</th>
-<th>OS</th>
-<th>Private IP</th>
-<th>Public IP</th>
-<th>CPU % (avg / peak)</th>
-<th>Memory % (avg / peak)</th>
-<th>Disk % (avg / peak)</th>
-</tr>
-"""
-
-
-    for resource in data["resources"]:
-
-        if resource.get("resource_type") == "Compute Instance":
-
-            html += f"""
-
-<tr>
-
-<td>
-{html_escape(resource["region"])}
-</td>
-
-<td>
-{html_escape(resource["compartment"])}
-</td>
-
-<td>
-{html_escape(resource["name"])}
-</td>
-
-<td class="
-{'healthy' if resource.get("state") == "RUNNING" else 'warning'}
-">
-{html_escape(resource["state"])}
-</td>
-
-<td>
-{html_escape(resource.get("shape"))}
-</td>
-
-<td>
-{html_escape(resource.get("os"))}
-</td>
-
-<td>
-{html_escape(resource.get("private_ip"))}
-</td>
-
-<td>
-{html_escape(resource.get("public_ip"))}
-</td>
-
-<td class="
-{'danger' if resource.get("cpu_percent") is not None and resource.get("cpu_percent") >= CPU_HIGH_PERCENT else ''}
-">
-{format_utilization(resource.get("cpu_percent"), resource.get("cpu_peak_percent"))}
-</td>
-
-<td class="
-{'danger' if resource.get("memory_percent") is not None and resource.get("memory_percent") >= MEMORY_HIGH_PERCENT else ''}
-">
-{format_utilization(resource.get("memory_percent"), resource.get("memory_peak_percent"))}
-</td>
-
-<td class="
-{'danger' if resource.get("disk_percent") is not None and resource.get("disk_percent") >= DISK_HIGH_PERCENT else ''}
-">
-{format_utilization(resource.get("disk_percent"), resource.get("disk_peak_percent"))}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- STORAGE -->
-<!-- ================================================== -->
-
-<div id="volume-policies" class="section">
-
-<h2>
-5. Volumes &amp; Backup Policies
-</h2>
-
-<p class="section-intro">
-Block and boot volumes with attachment status, attachment type, and
-whether a backup policy is assigned.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Boot Storage</div>
-<div class="value">{summary["total_boot_storage_tb"]:,.2f} TB</div>
-</div>
-
-<div class="card">
-<div class="title">Total Block Storage</div>
-<div class="value">{summary["total_block_storage_tb"]:,.2f} TB</div>
-</div>
-
-<div class="card">
-<div class="title">Boot Backup Storage</div>
-<div class="value">{summary["total_boot_backup_storage_tb"]:,.2f} TB</div>
-</div>
-
-<div class="card">
-<div class="title">Block Backup Storage</div>
-<div class="value">{summary["total_block_backup_storage_tb"]:,.2f} TB</div>
-</div>
-
-<div class="card">
-<div class="title">Total Backup Storage</div>
-<div class="value">{summary["total_backup_storage_tb"]:,.2f} TB</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Type</th>
-<th>Name</th>
-<th>State</th>
-<th>Size (GB)</th>
-<th>Attached To</th>
-<th>Attachment Type</th>
-<th>Backup Policy</th>
-</tr>
-"""
-
-
-    for resource in data["resources"]:
-
-        if resource.get("resource_type") not in [
-            "Block Volume",
-            "Boot Volume"
-        ]:
-            continue
-
-        policy_status = resource.get(
-            "backup_policy_status",
-            "UNKNOWN"
-        )
-
-        policy = resource.get(
-            "backup_policy_name"
-        ) or policy_status
-
-        attachment_status = resource.get(
-            "attachment_status", "UNKNOWN"
-        )
-
-        attached_to = (
-            resource.get("attached_instance", "N/A")
-            if attachment_status == "ATTACHED"
-            else "Detached"
-        )
-
-        html += f"""
-
-<tr>
-<td>{html_escape(resource["region"])}</td>
-<td>{html_escape(resource["compartment"])}</td>
-<td>{html_escape(resource["resource_type"])}</td>
-<td>{html_escape(resource["name"])}</td>
-<td>{html_escape(resource["state"])}</td>
-<td>{html_escape(resource.get("size_gb"))}</td>
-<td class="
-{'healthy' if attachment_status == 'ATTACHED' else 'warning'}
-">{html_escape(attached_to)}</td>
-<td>{html_escape(resource.get("attachment_type", "N/A"))}</td>
-<td class="
-{'healthy' if policy_status == 'ATTACHED' else 'warning'}
-">{html_escape(policy)}</td>
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-<h3>Volumes Without an Attached Backup Policy ({summary["volumes_without_backup_policy"]})</h3>
-
-<table>
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Type</th>
-<th>Name</th>
-<th>State</th>
-<th>OCID</th>
-</tr>
-{missing_policy_rows}
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- ALARMS -->
-<!-- ================================================== -->
-
-<div id="alarms" class="section">
-
-<h2>
-11. Alarms &amp; Notifications
-</h2>
-
-<p class="section-intro">
-Configured alarms and their current firing status across the
-tenancy.
-</p>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Name</th>
-<th>Status</th>
-<th>Severity</th>
-</tr>
-"""
-
-
-    for alarm in data["alarms"]:
-
-        status = str(
-            alarm.get("status", "")
-        ).upper()
-
-        alarm_class = (
-            "danger" if status == "FIRING"
-            else "warning" if status in ("DISABLED", "NO DATA")
-            else "healthy"
-        )
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(alarm["region"])}
-</td>
-
-<td>
-{html_escape(alarm["compartment"])}
-</td>
-
-<td>
-{html_escape(alarm["name"])}
-</td>
-
-<td class="{alarm_class}">
-{html_escape(status)}
-</td>
-
-<td>
-{html_escape(alarm["severity"])}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- ANNOUNCEMENTS -->
-<!-- ================================================== -->
-
-<div id="announcements" class="section">
-
-<h2>
-12. OCI Announcements
-</h2>
-
-<p class="section-intro">
-Active Oracle platform announcements relevant to this tenancy within
-the configured lookback window.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Announcements</div>
-<div class="value">{summary["total_announcements"]}</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Type</th>
-<th>Title</th>
-<th>Lifecycle</th>
-<th>Start</th>
-<th>End</th>
-</tr>
-"""
-
-
-    for announcement in data["announcements"]:
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(announcement["type"])}
-</td>
-
-<td>
-{html_escape(announcement["title"])}
-</td>
-
-<td>
-{html_escape(
-    announcement["lifecycle_state"]
-)}
-</td>
-
-<td>
-{html_escape(
-    announcement["time_one_start"]
-)}
-</td>
-
-<td>
-{html_escape(
-    announcement["time_one_end"]
-)}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- NETWORKING -->
-<!-- ================================================== -->
-
-<div id="networking" class="section">
-
-<h2>
-10. Networking &amp; Infrastructure
-</h2>
-
-<p class="section-intro">
-Core networking resources -- VCNs, subnets, gateways, and load
-balancers -- across all scanned regions.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">VCNs</div>
-<div class="value">{summary["total_vcns"]}</div>
-</div>
-
-<div class="card">
-<div class="title">VNICs</div>
-<div class="value">{summary["total_vnics"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Subnets</div>
-<div class="value">{summary["total_subnets"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Load Balancers</div>
-<div class="value">{summary["total_load_balancers"]}</div>
-</div>
-
-<div class="card">
-<div class="title">Gateways (NAT/IGW/SGW)</div>
-<div class="value">{summary["total_gateways"]}</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Region</th>
-<th>Compartment</th>
-<th>Resource Type</th>
-<th>Name</th>
-<th>State</th>
-<th>Details</th>
-</tr>
-"""
-
-
-    # Show selected networking resources
-    network_types = [
-        "VCN",
-        "Subnet",
-        "NAT Gateway",
-        "Internet Gateway",
-        "Service Gateway",
-        "Load Balancer"
-    ]
-
-
-    for resource in data["resources"]:
-
-        if (
-            resource.get("resource_type")
-            not in network_types
-        ):
-            continue
-
-        if resource.get("resource_type") == "Load Balancer":
-
-            ip_list = ", ".join(
-                ip for ip in resource.get("ip_addresses", [])
-                if ip
-            ) or "No IP assigned"
-
-            details = (
-                f'{resource.get("lb_type", "Classic")} | '
-                f'{resource.get("shape", "N/A")} | '
-                f'{ip_list}'
-            )
-
-        else:
-            details = "-"
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(resource["region"])}
-</td>
-
-<td>
-{html_escape(resource["compartment"])}
-</td>
-
-<td>
-{html_escape(resource["resource_type"])}
-</td>
-
-<td>
-{html_escape(resource["name"])}
-</td>
-
-<td class="
-{'healthy' if resource["state"] in ('ACTIVE', 'AVAILABLE') else 'warning'}
-">
-{html_escape(resource["state"])}
-</td>
-
-<td>
-{html_escape(details)}
-</td>
-
-</tr>
-"""
-
-
-    html += """
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- COLLECTION ERRORS -->
-<!-- ================================================== -->
-
-<div id="collection-errors" class="section">
-
-<h2>
-13. Collection / Permission Errors
-</h2>
-
-<p class="section-intro">
-Any API calls that failed during this run, with a likely cause where
-one is known.
-</p>
-
-<table>
-
-<tr>
-<th>Section</th>
-<th>Region</th>
-<th>Compartment</th>
-<th>Error</th>
-<th>Likely Cause</th>
-</tr>
-"""
-
-
-    for error in data["errors"]:
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(error["section"])}
-</td>
-
-<td>
-{html_escape(error["region"])}
-</td>
-
-<td>
-{html_escape(error["compartment"])}
-</td>
-
-<td class="warning">
-{html_escape(error["error"])}
-</td>
-
-<td class="muted">
-{html_escape(error.get("hint") or "-")}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-
-</table>
-
-</div>
-
-
-<!-- ================================================== -->
-<!-- COMPARTMENTS -->
-<!-- ================================================== -->
-
-<div id="compartments" class="section">
-
-<h2>
-2. Compartments
-</h2>
-
-<p class="section-intro">
-All active compartments discovered under the tenancy, including the
-root compartment.
-</p>
-
-<div class="cards">
-
-<div class="card">
-<div class="title">Total Compartments</div>
-<div class="value">{summary["compartments"]}</div>
-</div>
-
-</div>
-
-<table>
-
-<tr>
-<th>Name</th>
-<th>Path</th>
-<th>State</th>
-</tr>
-"""
-
-
-    for compartment in data["compartments"]:
-
-        html += f"""
-
-<tr>
-
-<td>
-{html_escape(compartment["name"])}
-</td>
-
-<td>
-{html_escape(compartment["path"])}
-</td>
-
-<td>
-{html_escape(compartment["state"])}
-</td>
-
-</tr>
-"""
-
-
-    html += f"""
-
-</table>
-
-</div>
-
-
+{sections_html}
 </main>
-
 </div>
 
-</div>
+<footer class="footer">
+&copy; {html_escape(metadata["generated_at"][:4])} ZainTECH. This report is confidential and intended solely for {customer}. Please do not forward without authorization.
+</footer>
 
-
-<div class="footer">
-
-&copy; {data["metadata"]["generated_at"][:4]} ZainTECH. This report is confidential and intended solely for
-{html_escape(data["metadata"]["customer_name"])}. Please do not forward without authorization.
-
-</div>
-
-
+<script>{REPORT_JS}</script>
 </body>
-
 </html>
 """
-
-    html = reorder_html_sections(html)
-
 
     with open(
         filename,
